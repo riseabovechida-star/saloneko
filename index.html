@@ -1,0 +1,2599 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>サロねこ — 美容室のお金、いっしょに見るにゃ</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      fontFamily: { sans: ['"M PLUS Rounded 1c"', 'sans-serif'] },
+      colors: {
+        cream: '#fbf7f3', peach: '#fff1ea', blush: '#ffe4e0',
+      },
+      boxShadow: { soft: '0 6px 24px -8px rgba(180,140,120,0.25)' },
+    } },
+  };
+</script>
+<style>
+  body { font-family: "M PLUS Rounded 1c", -apple-system, "Hiragino Maru Gothic ProN", sans-serif; -webkit-font-smoothing: antialiased; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 0.35; }
+  .tabnum { font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #e7d8cf; border-radius: 99px; }
+  input[type=range] { height: 6px; border-radius: 99px; }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; border: 3px solid #fb7185; box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer; margin-top: -1px;
+  }
+  input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 99px; background: #ffe0d6; }
+  .fadein { animation: fadein .35s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body class="bg-cream text-stone-700">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ============================================================
+   フォーマッタ / ユーティリティ
+   ============================================================ */
+const yen = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+const man = (n) => {
+  if (!isFinite(n)) return '—';
+  const m = (n || 0) / 10000;
+  if (Math.abs(m) >= 1000) return (m / 1000).toFixed(2) + '億円';
+  return (Math.round(m * 10) / 10).toLocaleString('ja-JP') + '万円';
+};
+const pct = (n) => (isFinite(n) ? (n * 100).toFixed(1) + '%' : '—');
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const ym = (dateStr) => (dateStr || '').slice(0, 7); // YYYY-MM
+
+// 数字がカウントアップしていくアニメ（積み上げカウンター用）
+// マウントのたびに 0 から目標へパラパラ動く（ホームに戻るたび再生）
+function useCountUp(target, dur = 1300) {
+  const [v, setV] = useState(0);
+  const prev = useRef(0);
+  useEffect(() => {
+    const from = prev.current, to = target;
+    prev.current = to;
+    if (from === to) { setV(to); return; }
+    let raf, start;
+    const tick = (t) => {
+      if (start == null) start = t;
+      const p = Math.min(1, (t - start) / dur);
+      setV(from + (to - from) * (1 - Math.pow(1 - p, 3)));
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+  return v;
+}
+
+/* ============================================================
+   領収書画像ストア（IndexedDB） — 画像は localStorage に入れず IDB に
+   ============================================================ */
+const ReceiptStore = {
+  _db: null,
+  open() {
+    if (this._db) return Promise.resolve(this._db);
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('salon-finance-receipts', 1);
+      r.onupgradeneeded = (e) => e.target.result.createObjectStore('img');
+      r.onsuccess = () => { this._db = r.result; res(r.result); };
+      r.onerror = () => rej(r.error);
+    });
+  },
+  async put(key, blob) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const t = db.transaction('img', 'readwrite');
+      t.objectStore('img').put(blob, key);
+      t.oncomplete = res; t.onerror = () => rej(t.error);
+    });
+  },
+  async get(key) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const rq = db.transaction('img', 'readonly').objectStore('img').get(key);
+      rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+    });
+  },
+  async del(key) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const t = db.transaction('img', 'readwrite');
+      t.objectStore('img').delete(key);
+      t.oncomplete = res; t.onerror = () => rej(t.error);
+    });
+  },
+};
+
+// カメラ/ファイルの画像を縮小してJPEG Blobに（容量節約）
+function compressImage(file, maxW = 1280, quality = 0.7) {
+  return new Promise((res) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxW / img.width);
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(img.width * scale);
+      cv.height = Math.round(img.height * scale);
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      cv.toBlob((b) => { URL.revokeObjectURL(img.src); res(b); }, 'image/jpeg', quality);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+/* ============================================================
+   税額の概算（個人事業主 / 法人）
+   ============================================================ */
+function progressiveIncomeTax(taxable) {
+  const brackets = [
+    [1950000, 0.05, 0], [3300000, 0.10, 97500], [6950000, 0.20, 427500],
+    [9000000, 0.23, 636000], [18000000, 0.33, 1536000],
+    [40000000, 0.40, 2796000], [Infinity, 0.45, 4796000],
+  ];
+  for (const [cap, rate, ded] of brackets) if (taxable <= cap) return Math.max(0, taxable * rate - ded);
+  return 0;
+}
+
+// 個人事業主の概算税額（年額）。businessIncome＝事業所得（青色控除前 ＝ 売上−経費）
+function estimateSoleTax(businessIncome, opt) {
+  const blue = opt.blueDeduction || 0;            // 青色申告特別控除
+  const social = opt.socialInsurance || 0;         // 国保＋年金（社会保険料控除）
+  const otherDed = opt.otherDeductions || 0;       // 生命保険料控除など
+  const basic = 480000;                            // 基礎控除
+  const afterBlue = Math.max(0, businessIncome - blue);
+  const taxable = Math.max(0, afterBlue - basic - social - otherDed);
+  const incomeTax = progressiveIncomeTax(taxable);
+  const reconstruction = incomeTax * 0.021;        // 復興特別所得税
+  const residentTax = taxable > 0 ? taxable * 0.10 + 5000 : 0; // 住民税（所得割10%＋均等割概算）
+  const businessTax = Math.max(0, businessIncome - 2900000) * 0.05; // 個人事業税（美容業5%・事業主控除290万）
+  const total = incomeTax + reconstruction + residentTax + businessTax;
+  return { afterBlue, taxable, incomeTax, reconstruction, residentTax, businessTax, total };
+}
+
+/* ============================================================
+   財務エンジン — state から派生指標をすべて計算する純粋関数
+   ============================================================ */
+function compute(s) {
+  const c = s.current;
+  // 売上：日次ログ（税込）から税別へ仕分け。なければ手入力の月商（税別）
+  const taxRate = s.settings.taxRate || 0;
+  const hoursPerDay = s.settings.businessHoursPerDay || 8;
+  const grossOf = (d) => ((d.gross != null ? d.gross : d.amount) || 0); // 旧データ(amount)互換
+  const logged = c.dailySales.filter((d) => grossOf(d) > 0);
+  const dayCount = logged.length;
+  const totalGross = logged.reduce((a, d) => a + grossOf(d), 0);
+  const totalNet = totalGross / (1 + taxRate);
+  const totalCustomers = logged.reduce((a, d) => a + (d.customers || 0), 0);
+  const dailyAvgGross = dayCount ? totalGross / dayCount : 0;
+  const dailyAvgNet = dayCount ? totalNet / dayCount : 0;
+  const salesFromLog = dailyAvgNet * c.openDaysPerMonth;         // 税別の月商見込み
+  const monthlySales = c.useLog && dayCount ? salesFromLog : c.monthlySales; // 税別
+  // 効率指標
+  const avgSpend = totalCustomers ? totalGross / totalCustomers : 0;  // 客単価（税込）
+  const avgCustomersPerDay = dayCount ? totalCustomers / dayCount : 0;
+  const hourlyNet = hoursPerDay ? dailyAvgNet / hoursPerDay : 0;       // 時間単価（税別）
+  const consumptionTaxMonthly = monthlySales * taxRate;               // 預かり消費税（参考）
+  const dailyAvg = dailyAvgNet; // 後方互換
+
+  // 変動費
+  const variableRate = c.materialCostRate + c.otherVariableRate;
+  const variableCost = monthlySales * variableRate;
+  const marginRate = 1 - variableRate; // 限界利益率
+  const marginalProfit = monthlySales * marginRate; // 限界利益
+
+  const isSole = s.settings.businessType === '個人事業主';
+
+  // 会計期間：個人＝1〜12月 / 法人＝期首〜期末
+  const fiscalStart = isSole ? 1 : (s.settings.fiscalStartMonth || 4);
+  // スタッフの今期 在籍月数（startMonth未設定＝通年12ヶ月、設定あり＝その月から期末まで）
+  const activeMonthsOf = (p) => {
+    if (!p.startMonth) return 12;
+    return 12 - (((p.startMonth - fiscalStart) % 12 + 12) % 12);
+  };
+  const staffAnnual = c.staff.map((p) => {
+    const months = activeMonthsOf(p);
+    return { id: p.id, months, annual: (p.monthlySalary || 0) * months };
+  });
+  const annualStaffSalary = staffAnnual.reduce((a, x) => a + x.annual, 0);
+
+  // 人件費（従業員＝社会保険の会社負担を上乗せ）— 月次モデルは現在の在籍者ベース
+  const staffSalary = c.staff.reduce((a, p) => a + (p.monthlySalary || 0), 0);
+  const staffLabor = staffSalary * (1 + c.socialInsuranceRate);
+  // オーナー報酬：法人のみ経費（役員報酬）。個人事業主は経費にならない（生活費で引き出す）
+  const ownerPay = isSole ? 0 : c.ownerSalary;
+  const laborCost = staffLabor + ownerPay;
+
+  // 固定費
+  const fixedCost = c.rent + c.utilities + c.otherFixed + laborCost;
+
+  // 利益（個人事業主では＝事業所得・控除前 / 法人では税引前利益）
+  const operatingProfit = monthlySales - variableCost - fixedCost;
+  const profitRate = monthlySales ? operatingProfit / monthlySales : 0;
+
+  /* ---- 生活費・税金・手取り ---- */
+  const livingMonthly = s.living.items.reduce((a, x) => a + (x.amount || 0), 0);
+  const livingAnnual = livingMonthly * 12;
+  const businessIncomeAnnual = operatingProfit * 12; // 個人：事業所得(控除前) / 法人：税引前利益
+
+  let taxAnnual, taxDetail;
+  if (isSole) {
+    taxDetail = estimateSoleTax(businessIncomeAnnual, {
+      blueDeduction: s.settings.blueDeduction,
+      socialInsurance: s.settings.socialInsurance,
+      otherDeductions: s.settings.otherDeductions,
+    });
+    taxAnnual = taxDetail.total;
+  } else {
+    taxAnnual = Math.max(0, businessIncomeAnnual) * s.settings.corpTaxRate;
+    taxDetail = { total: taxAnnual };
+  }
+  const taxMonthly = taxAnnual / 12;
+  // 手取り（事業から個人に残るお金）
+  const netMonthly = operatingProfit - taxMonthly;
+  // 積立余力：個人＝手取り−生活費 / 法人＝税引後利益（生活費は役員報酬で別途充当済み）
+  const monthlySavingCapacity = isSole ? netMonthly - livingMonthly : netMonthly;
+
+  // 損益分岐点
+  const breakEvenSales = marginRate > 0 ? fixedCost / marginRate : Infinity;
+  const breakEvenRatio = monthlySales ? breakEvenSales / monthlySales : Infinity;
+  const safetyMargin = monthlySales ? (monthlySales - breakEvenSales) / monthlySales : 0;
+
+  // 年間
+  const annualProfit = operatingProfit * 12;
+
+  /* ---- 出店計画 ---- */
+  const e = s.expansion;
+  const interior = e.tsubo * e.interiorCostPerTsubo;
+  const deposit = e.newRent * e.depositMonths;
+  const recruit = e.recruitCostPerStaff * e.newStaffCount;
+  const initialCost = interior + e.equipmentCost + deposit + recruit + e.miscInitial;
+
+  // 新店の月次ランニング固定費
+  const newLabor = e.newStaffCount * e.avgStaffSalary * (1 + c.socialInsuranceRate);
+  const newRunningFixed = e.newRent + e.newUtilities + newLabor + e.newOtherFixed;
+  const workingCapital = newRunningFixed * e.workingCapitalMonths;
+
+  const totalNeeded = initialCost + workingCapital;
+
+  // 自己資金目標 / 借入
+  const selfFundsTarget = totalNeeded * e.selfFundsRatio;
+  const loanNeeded = Math.max(0, totalNeeded - selfFundsTarget);
+
+  // 積立計画：目標自己資金まで、現在の現預金からあといくら積むか
+  const months = Math.max(1, e.yearsUntil * 12);
+  const gapToSelfFunds = Math.max(0, selfFundsTarget - c.cashOnHand);
+  const requiredMonthlySaving = gapToSelfFunds / months;
+  // monthlySavingCapacity は生活費・税引後ベースで上で算出済み
+  const savingShortfall = monthlySavingCapacity - requiredMonthlySaving; // プラスなら達成可能
+  const projectedSelfFunds = c.cashOnHand + Math.max(0, monthlySavingCapacity) * months;
+  const planFeasible = projectedSelfFunds >= selfFundsTarget;
+  // 達成に必要な月数（現キャパで）
+  const monthsToTarget = monthlySavingCapacity > 0 ? Math.ceil(gapToSelfFunds / monthlySavingCapacity) : Infinity;
+
+  /* ---- 借入返済シミュレーション（元利均等） ---- */
+  const L = s.loan;
+  const principal = L.useLoanNeeded ? loanNeeded : L.amount;
+  const r = L.interestRate / 12;
+  const n = L.termYears * 12;
+  const monthlyRepay = r > 0 ? (principal * r) / (1 - Math.pow(1 + r, -n)) : principal / n;
+  const totalRepay = monthlyRepay * n;
+  const totalInterest = totalRepay - principal;
+  // 日本政策金融公庫の目安：自己資金の約2〜3倍が借入可能の目安
+  const borrowableEstimate = c.cashOnHand * L.borrowMultiple;
+  // 返済後の新店損益余力（新店が黒字化するまでの体力）
+  const newStoreOperatingProfit = e.expectedMonthlySales - e.expectedMonthlySales * variableRate - newRunningFixed;
+  const newStoreAfterRepay = newStoreOperatingProfit - monthlyRepay;
+
+  /* ---- 領収書・経費の集計 ---- */
+  const receipts = s.receipts || [];
+  // 科目別合計（領収書）
+  const receiptByCategory = {};
+  let receiptTotal = 0;
+  receipts.forEach((rcp) => {
+    receiptByCategory[rcp.category] = (receiptByCategory[rcp.category] || 0) + (rcp.amount || 0);
+    receiptTotal += rcp.amount || 0;
+  });
+  // 月別集計（売上ログ＋領収書）
+  const monthsMap = {};
+  const touch = (k) => (monthsMap[k] = monthsMap[k] || { sales: 0, expense: 0, count: 0, customers: 0, days: 0 });
+  c.dailySales.forEach((d) => { if (d.date && grossOf(d) > 0) { const o = touch(ym(d.date)); o.sales += grossOf(d) / (1 + taxRate); o.customers += d.customers || 0; o.days++; } });
+  receipts.forEach((rcp) => { if (rcp.date) { const o = touch(ym(rcp.date)); o.expense += rcp.amount || 0; o.count++; } });
+  const monthly = Object.keys(monthsMap).sort().map((k) => ({
+    month: k, ...monthsMap[k], profit: monthsMap[k].sales - monthsMap[k].expense,
+    avgSpend: monthsMap[k].customers ? (monthsMap[k].sales * (1 + taxRate)) / monthsMap[k].customers : 0,
+  }));
+
+  /* ---- 今月の黒字メーター（積み上げ式） ---- */
+  const _now = new Date();
+  const thisMonthKey = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}`;
+  const tmo = monthsMap[thisMonthKey] || { sales: 0, days: 0, customers: 0 };
+  const thisMonthNet = tmo.sales;                 // 今月の売上（税別・実績）
+  const thisMonthDays = tmo.days || 0;
+  const beReached = thisMonthNet >= breakEvenSales;
+  const beRemaining = Math.max(0, breakEvenSales - thisMonthNet);     // 黒字まであと（税別）
+  const beSurplus = Math.max(0, thisMonthNet - breakEvenSales);       // 黒字の超過分（税別）
+  // 残り営業日 ＝ 今日以降で「定休日・臨時休業・入力済み」を除いた日数
+  const _y = _now.getFullYear(), _mo = _now.getMonth();
+  const _dim = new Date(_y, _mo + 1, 0).getDate();
+  const _closedWd = s.settings.closedWeekdays || [];
+  const _closedDays = c.closedDays || [];
+  const _recorded = new Set(c.dailySales.map((x) => x.date));
+  let remainingOpenDays = 0;
+  for (let dd = _now.getDate(); dd <= _dim; dd++) {
+    const ds = `${thisMonthKey}-${String(dd).padStart(2, '0')}`;
+    const wday = new Date(_y, _mo, dd).getDay();
+    if (_recorded.has(ds)) continue;
+    if (_closedWd.includes(wday)) continue;
+    if (_closedDays.includes(ds)) continue;
+    remainingOpenDays++;
+  }
+  const perDayToBE = (remainingOpenDays > 0 ? beRemaining / remainingOpenDays : beRemaining) * (1 + taxRate); // 税込/日
+  // 今月のもうけ（実績ベース）＝ 今月売上×限界利益率 − 固定費
+  const thisMonthProfit = thisMonthNet * marginRate - fixedCost;
+  // 今年の積み上げもうけ（データのある月だけ合算）
+  const _yearStr = String(_now.getFullYear());
+  let ytdProfit = 0, ytdMonths = 0;
+  monthly.forEach((r) => {
+    if (r.month.slice(0, 4) === _yearStr && r.sales > 0) { ytdProfit += r.sales * marginRate - fixedCost; ytdMonths++; }
+  });
+
+  /* ---- 確定申告まとめ（年間・青色申告決算書ベース） ---- */
+  // 売上：日次ログ実績があればその年換算、なければ月商×12
+  const annualSales = monthlySales * 12;
+  // 経費を科目別に（定期費用×12 ＋ 領収書）
+  const expenseByItem = {
+    '仕入（材料費）': monthlySales * c.materialCostRate * 12,
+    '給料賃金': annualStaffSalary,
+    '法定福利費': annualStaffSalary * c.socialInsuranceRate,
+    '地代家賃': c.rent * 12,
+    '水道光熱費': c.utilities * 12,
+    'その他固定費': c.otherFixed * 12,
+  };
+  if (!isSole) expenseByItem['役員報酬'] = c.ownerSalary * 12;
+  // 領収書の科目を加算
+  Object.keys(receiptByCategory).forEach((cat) => {
+    expenseByItem[cat] = (expenseByItem[cat] || 0) + receiptByCategory[cat];
+  });
+  const totalExpense = Object.values(expenseByItem).reduce((a, v) => a + v, 0);
+  const grossProfit = annualSales - totalExpense; // 所得金額（青色控除前）＝事業所得
+
+  /* ---- 1年の目標（月目標 vs 実績・着地予想） ---- */
+  const plan = s.plan;
+  const planYear = plan.year;
+  const actualByMonth = Array(12).fill(0);
+  c.dailySales.forEach((d) => {
+    if (d.date && d.date.slice(0, 4) === String(planYear)) {
+      const mi = parseInt(d.date.slice(5, 7), 10) - 1;
+      if (mi >= 0 && mi < 12) actualByMonth[mi] += grossOf(d);
+    }
+  });
+  const planRows = plan.monthlyTargets.map((t, i) => ({
+    month: i + 1, target: t, actual: actualByMonth[i],
+    rate: t ? actualByMonth[i] / t : 0,
+  }));
+  const planAnnualTarget = plan.monthlyTargets.reduce((a, v) => a + v, 0);
+  const planActualTotal = actualByMonth.reduce((a, v) => a + v, 0);
+  const monthsWithData = actualByMonth.filter((v) => v > 0).length;
+  const planForecast = monthsWithData ? (planActualTotal / monthsWithData) * 12 : 0; // 着地予想
+  const planAchievement = planAnnualTarget ? planActualTotal / planAnnualTarget : 0;
+  const planForecastVsTarget = planAnnualTarget ? planForecast / planAnnualTarget : 0;
+
+  return {
+    isSole, livingMonthly, livingAnnual, businessIncomeAnnual,
+    taxAnnual, taxMonthly, taxDetail, netMonthly,
+    receiptByCategory, receiptTotal, receiptCount: receipts.length,
+    monthly, annualSales, expenseByItem, totalExpense, grossProfit,
+    planRows, planAnnualTarget, planActualTotal, monthsWithData,
+    planForecast, planAchievement, planForecastVsTarget,
+    fiscalStart, staffAnnual, annualStaffSalary,
+    thisMonthNet, thisMonthDays, beReached, beRemaining, beSurplus, remainingOpenDays, perDayToBE,
+    thisMonthProfit, ytdProfit, ytdMonths,
+    taxRate, hoursPerDay, totalGross, totalNet, totalCustomers, dayCount,
+    dailyAvgGross, dailyAvgNet, avgSpend, avgCustomersPerDay, hourlyNet, consumptionTaxMonthly,
+    monthlySales, dailyAvg, salesFromLog, loggedCount: logged.length,
+    variableRate, variableCost, marginRate, marginalProfit,
+    staffSalary, laborCost, fixedCost,
+    operatingProfit, profitRate, annualProfit,
+    breakEvenSales, breakEvenRatio, safetyMargin,
+    // expansion
+    interior, deposit, recruit, initialCost,
+    newLabor, newRunningFixed, workingCapital, totalNeeded,
+    selfFundsTarget, loanNeeded, months, gapToSelfFunds,
+    requiredMonthlySaving, monthlySavingCapacity, savingShortfall,
+    projectedSelfFunds, planFeasible, monthsToTarget,
+    // loan
+    principal, monthlyRepay, totalRepay, totalInterest, borrowableEstimate,
+    newStoreOperatingProfit, newStoreAfterRepay,
+  };
+}
+
+/* ============================================================
+   初期データ（個人サロンのリアルな目安値）
+   ============================================================ */
+const DEFAULT_STATE = {
+  settings: {
+    businessType: '個人事業主',  // '個人事業主' | '法人'
+    blueDeduction: 650000,       // 青色申告特別控除 65/55/10万
+    socialInsurance: 400000,     // 国保＋年金の年額（社会保険料控除）
+    otherDeductions: 0,          // 生命保険料控除など
+    corpTaxRate: 0.30,           // 法人実効税率（概算）
+    taxYear: 2026,
+    taxRate: 0.10,               // 消費税率（税込→税別の仕分け用）
+    businessHoursPerDay: 8,      // 1日の営業時間（時間単価の算出用）
+    fiscalStartMonth: 4,         // 法人の期首月（個人は1月固定）
+    mascotType: 'cat',           // 相棒キャラ cat/dog/tiger/squirrel/namihei
+    closedWeekdays: [],          // 定休日（曜日 0=日〜6=土）
+  },
+  living: {
+    items: [
+      { id: 1, label: '住居費（自宅）', amount: 90000 },
+      { id: 2, label: '食費', amount: 60000 },
+      { id: 3, label: '水道光熱・通信', amount: 30000 },
+      { id: 4, label: '保険・年金（家計）', amount: 25000 },
+      { id: 5, label: 'その他・予備', amount: 45000 },
+    ],
+  },
+  receipts: [], // { id, date, vendor, amount, category, memo, hasImage }
+  plan: {
+    year: 2026,
+    monthlyTargets: [1650000, 1500000, 1700000, 1650000, 1700000, 1600000,
+                     1650000, 1500000, 1700000, 1750000, 1800000, 2000000], // 税込の月目標
+  },
+  current: {
+    monthlySales: 1500000,       // 税別の月商（直接入力モード時）
+    useLog: true,                // 既定は日次入力から自動算出
+    openDaysPerMonth: 25,
+    dailySales: [],              // { date, gross(税込), customers }
+    closedDays: [],              // 臨時休業の日付 'YYYY-MM-DD'
+    materialCostRate: 0.10,   // 材料費率
+    otherVariableRate: 0.03,  // その他変動費（カード手数料等）
+    rent: 200000,
+    utilities: 50000,
+    otherFixed: 80000,        // 通信・広告・消耗品など
+    staff: [
+      { id: 1, name: 'スタイリストA', role: 'スタイリスト', monthlySalary: 280000 },
+      { id: 2, name: 'アシスタントB', role: 'アシスタント', monthlySalary: 200000 },
+    ],
+    ownerSalary: 400000,         // オーナー（自分）の役員報酬/生活費
+    includeOwnerSalary: false,   // false=固定費に役員報酬を別建て（保険料は乗せない）
+    socialInsuranceRate: 0.15,   // 社会保険 会社負担
+    monthlyDrawdown: 0,          // 利益から積立外に抜く生活費（役員報酬と別管理する場合）
+    cashOnHand: 3000000,         // 現預金残高
+  },
+  expansion: {
+    yearsUntil: 3,
+    tsubo: 15,
+    seats: 4,
+    interiorCostPerTsubo: 600000, // 内装 ¥60万/坪
+    equipmentCost: 2000000,        // 設備（シャンプー台・椅子など）
+    depositMonths: 10,             // 敷金・礼金（家賃の月数）
+    newRent: 300000,
+    recruitCostPerStaff: 200000,
+    newStaffCount: 2,
+    miscInitial: 500000,           // 開業諸経費・予備費
+    newUtilities: 60000,
+    newOtherFixed: 100000,
+    avgStaffSalary: 250000,
+    workingCapitalMonths: 6,       // 運転資金（固定費の月数）
+    selfFundsRatio: 0.33,          // 自己資金比率の目標（総額の1/3）
+    expectedMonthlySales: 1800000, // 新店の想定月商
+  },
+  loan: {
+    useLoanNeeded: true, // 出店計画の借入必要額を使う
+    amount: 10000000,
+    interestRate: 0.022, // 年利
+    termYears: 7,
+    borrowMultiple: 2.5, // 自己資金倍率の目安
+  },
+};
+
+/* ============================================================
+   共通UIコンポーネント
+   ============================================================ */
+function Card({ children, className = '' }) {
+  return <div className={'bg-white rounded-3xl shadow-soft border border-stone-100 ' + className}>{children}</div>;
+}
+
+function KPI({ label, value, sub, tone = 'slate', big }) {
+  const tones = {
+    slate: 'text-stone-700', green: 'text-emerald-500', red: 'text-rose-500',
+    blue: 'text-sky-500', amber: 'text-amber-500', violet: 'text-rose-400',
+  };
+  const bgs = {
+    slate: 'bg-stone-50', green: 'bg-emerald-50', red: 'bg-rose-50',
+    blue: 'bg-peach', amber: 'bg-amber-50', violet: 'bg-blush',
+  };
+  return (
+    <div className={'rounded-3xl p-4 border border-white shadow-soft ' + (bgs[tone] || bgs.slate)}>
+      <div className="text-xs text-stone-400 mb-1 font-medium">{label}</div>
+      <div className={(big ? 'text-2xl' : 'text-xl') + ' font-extrabold tabnum ' + (tones[tone] || tones.slate)}>{value}</div>
+      {sub && <div className="text-xs text-stone-400 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, unit = '円', step = 1000, min = 0, hint }) {
+  return (
+    <label className="block">
+      <div className="flex justify-between items-baseline">
+        <span className="text-sm text-stone-500 font-medium">{label}</span>
+        {value > 0 && unit === '円' && <span className="text-xs text-rose-300 tabnum">{man(value)}</span>}
+      </div>
+      <div className="mt-1.5 flex items-center rounded-2xl border-2 border-stone-100 bg-stone-50 focus-within:border-rose-200 focus-within:bg-white transition-colors overflow-hidden">
+        <input
+          type="number" value={value} step={step} min={min}
+          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+          className="w-full px-3 py-2.5 outline-none tabnum text-right bg-transparent"
+        />
+        <span className="px-3 text-sm text-stone-400 self-stretch flex items-center">{unit}</span>
+      </div>
+      {hint && <div className="text-xs text-stone-400 mt-1">{hint}</div>}
+    </label>
+  );
+}
+
+// ％入力用フィールド（内部は小数で保持、画面では%で入出力）
+function PercentField({ label, value, onChange, hint, step = 1 }) {
+  return (
+    <Field label={label} unit="%" step={step} min={0}
+      value={Math.round((value || 0) * 1000) / 10}
+      onChange={(v) => onChange((v || 0) / 100)} hint={hint} />
+  );
+}
+
+// ％で設定 → その％の金額も表示するフィールド
+function RateAmountField({ label, rate, onChange, amount, step = 1, hint }) {
+  return (
+    <div>
+      <PercentField label={label} value={rate} onChange={onChange} step={step} hint={hint} />
+      <div className="mt-1.5 bg-peach rounded-xl px-3 py-2 text-sm flex justify-between items-center">
+        <span className="text-stone-500">今の売上だと</span>
+        <b className="text-rose-400 tabnum">約 {man(amount)} / 月</b>
+      </div>
+    </div>
+  );
+}
+
+function Slider({ label, value, onChange, min, max, step, fmt }) {
+  return (
+    <label className="block">
+      <div className="flex justify-between items-baseline text-sm">
+        <span className="text-stone-500 font-medium">{label}</span>
+        <span className="font-bold text-rose-400 tabnum text-base">{fmt ? fmt(value) : value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-full mt-2.5" />
+    </label>
+  );
+}
+
+/* ============================================================
+   損益分岐点チャート（SVG）
+   ============================================================ */
+function BreakEvenChart({ m }) {
+  const W = 520, H = 300, pad = 48;
+  const maxSales = Math.max(m.monthlySales, m.breakEvenSales) * 1.4 || 1;
+  const x = (v) => pad + (v / maxSales) * (W - pad * 2);
+  const y = (v) => H - pad - (v / maxSales) * (H - pad * 2);
+  const salesLine = `M ${x(0)} ${y(0)} L ${x(maxSales)} ${y(maxSales)}`;
+  const costAt = (sv) => m.fixedCost + sv * m.variableRate;
+  const costLine = `M ${x(0)} ${y(costAt(0))} L ${x(maxSales)} ${y(costAt(maxSales))}`;
+  const bx = x(m.breakEvenSales), by = y(m.breakEvenSales);
+  const cur = x(m.monthlySales);
+  const profitArea = `M ${bx} ${by} L ${x(maxSales)} ${y(maxSales)} L ${x(maxSales)} ${y(costAt(maxSales))} Z`;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+      <rect x="0" y="0" width={W} height={H} fill="white" />
+      {/* 利益ゾーン */}
+      {isFinite(m.breakEvenSales) && <path d={profitArea} fill="#10b98122" />}
+      {/* 軸 */}
+      <line x1={pad} y1={H - pad} x2={W - pad} y2={H - pad} stroke="#cbd5e1" />
+      <line x1={pad} y1={pad} x2={pad} y2={H - pad} stroke="#cbd5e1" />
+      {/* 費用線 */}
+      <path d={costLine} stroke="#f43f5e" strokeWidth="2.5" fill="none" />
+      {/* 売上線 */}
+      <path d={salesLine} stroke="#0ea5e9" strokeWidth="2.5" fill="none" />
+      {/* 損益分岐点 */}
+      {isFinite(m.breakEvenSales) && (
+        <g>
+          <circle cx={bx} cy={by} r="5" fill="#7c3aed" />
+          <line x1={bx} y1={by} x2={bx} y2={H - pad} stroke="#7c3aed" strokeDasharray="4 3" />
+          <text x={bx} y={H - pad + 16} fontSize="10" fill="#7c3aed" textAnchor="middle">ここが分かれ目</text>
+        </g>
+      )}
+      {/* 現在の売上 */}
+      <line x1={cur} y1={pad} x2={cur} y2={H - pad} stroke="#0ea5e9" strokeDasharray="3 3" opacity="0.5" />
+      <text x={cur} y={pad - 6} fontSize="10" fill="#0ea5e9" textAnchor="middle">現在 {man(m.monthlySales)}</text>
+      {/* 凡例 */}
+      <g fontSize="11">
+        <rect x={W - 150} y={pad} width="10" height="10" fill="#0ea5e9" /><text x={W - 135} y={pad + 9} fill="#475569">売上</text>
+        <rect x={W - 150} y={pad + 18} width="10" height="10" fill="#f43f5e" /><text x={W - 135} y={pad + 27} fill="#475569">かかるお金</text>
+      </g>
+    </svg>
+  );
+}
+
+/* ============================================================
+   積立進捗チャート（自己資金の到達見込み）
+   ============================================================ */
+function SavingChart({ s, m }) {
+  const W = 520, H = 220, pad = 40;
+  const months = m.months;
+  const target = m.selfFundsTarget;
+  const start = s.current.cashOnHand;
+  const cap = Math.max(0, m.monthlySavingCapacity);
+  const maxY = Math.max(target, start + cap * months) * 1.1 || 1;
+  const x = (mo) => pad + (mo / months) * (W - pad * 2);
+  const y = (v) => H - pad - (v / maxY) * (H - pad * 2);
+  const path = `M ${x(0)} ${y(start)} L ${x(months)} ${y(start + cap * months)}`;
+  const ty = y(target);
+  // 目標到達月
+  const reachMonth = cap > 0 ? (target - start) / cap : Infinity;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+      <rect width={W} height={H} fill="white" />
+      <line x1={pad} y1={H - pad} x2={W - pad} y2={H - pad} stroke="#cbd5e1" />
+      <line x1={pad} y1={pad} x2={pad} y2={H - pad} stroke="#cbd5e1" />
+      {/* 目標ライン */}
+      <line x1={pad} y1={ty} x2={W - pad} y2={ty} stroke="#f59e0b" strokeDasharray="5 3" />
+      <text x={W - pad} y={ty - 5} fontSize="10" fill="#f59e0b" textAnchor="end">自己資金目標 {man(target)}</text>
+      {/* 積立見込み */}
+      <path d={path} stroke="#10b981" strokeWidth="2.5" fill="none" />
+      <circle cx={x(0)} cy={y(start)} r="4" fill="#10b981" />
+      <circle cx={x(months)} cy={y(start + cap * months)} r="4" fill="#10b981" />
+      {/* 到達点 */}
+      {isFinite(reachMonth) && reachMonth <= months && reachMonth >= 0 && (
+        <g>
+          <circle cx={x(reachMonth)} cy={ty} r="5" fill="#7c3aed" />
+          <text x={x(reachMonth)} y={ty + 16} fontSize="10" fill="#7c3aed" textAnchor="middle">{Math.ceil(reachMonth)}ヶ月で到達</text>
+        </g>
+      )}
+      <text x={pad} y={H - pad + 14} fontSize="10" fill="#94a3b8">現在</text>
+      <text x={W - pad} y={H - pad + 14} fontSize="10" fill="#94a3b8" textAnchor="end">{m.months}ヶ月後</text>
+    </svg>
+  );
+}
+
+/* ============================================================
+   キャラクター：相棒（猫・犬・トラ・リス・浪平）切替式
+   ============================================================ */
+const MASCOTS = {
+  cat:      { label: '猫',   call: 'にゃ', name: 'サロねこ' },
+  dog:      { label: '犬',   call: 'わん', name: 'サロいぬ' },
+  tiger:    { label: 'トラ', call: 'がおっ', name: 'サロとら' },
+  squirrel: { label: 'リス', call: 'ちゅん', name: 'サロりす' },
+  namihei:  { label: '浪平', call: 'じゃ', name: '波平さん' },
+};
+const MASCOT_ORDER = ['cat', 'dog', 'tiger', 'squirrel', 'namihei'];
+
+function Mascot({ type = 'cat', size = 64, mood = 'happy' }) {
+  const C = {
+    cat:      { body: '#fff7f2', face: '#fffaf6', edge: '#f3d9cf', ear: '#fff7f2', inner: '#f8b6c0', whisk: '#e8cabf' },
+    dog:      { body: '#fdf3e7', face: '#fff8ef', edge: '#e3c198', ear: '#dcab78', inner: '#c88f5c', whisk: '#e6c7a8' },
+    tiger:    { body: '#ffe2c0', face: '#fff0db', edge: '#eaa863', ear: '#ffd3a0', inner: '#ef9d52', whisk: '#eabd8f' },
+    squirrel: { body: '#f3d8bc', face: '#fbe9d5', edge: '#cf9f72', ear: '#e2bc8f', inner: '#cf9f72', whisk: '#d8b48c' },
+    namihei:  { body: '#f3c79c', face: '#f6d2aa', edge: '#dba778', ear: '#f3c79c', inner: '#e7b07f', whisk: '#caa078' },
+  }[type] || {};
+  const human = type === 'namihei';
+  const ink = human ? '#4a3b33' : '#6b4f4a';
+  const eyes = {
+    happy: <g><path d="M37 47 Q41 43 45 47" stroke={ink} strokeWidth="2.4" fill="none" strokeLinecap="round" /><path d="M55 47 Q59 43 63 47" stroke={ink} strokeWidth="2.4" fill="none" strokeLinecap="round" /></g>,
+    cheer: <g><path d="M36 46 Q41 41 46 46" stroke={ink} strokeWidth="2.6" fill="none" strokeLinecap="round" /><path d="M54 46 Q59 41 64 46" stroke={ink} strokeWidth="2.6" fill="none" strokeLinecap="round" /><text x="25" y="35" fontSize="11">✨</text><text x="66" y="35" fontSize="11">✨</text></g>,
+    think: <g><circle cx="42" cy="46" r="2.6" fill={ink} /><circle cx="60" cy="46" r="2.6" fill={ink} /></g>,
+    worry: <g><ellipse cx="42" cy="47" rx="2.6" ry="3" fill={ink} /><ellipse cx="60" cy="47" rx="2.6" ry="3" fill={ink} /><path d="M71 40 q3 4 0 7 q-3 -3 0 -7" fill="#9fd3ee" /></g>,
+  };
+  const mouth = mood === 'worry'
+    ? <path d="M46 56 Q51 53 56 56" stroke={ink} strokeWidth="1.8" fill="none" strokeLinecap="round" />
+    : <path d="M47 54 Q51 58 55 54" stroke={ink} strokeWidth="1.8" fill="none" strokeLinecap="round" />;
+
+  return (
+    <svg viewBox="0 0 100 100" width={size} height={size} style={{ display: 'block' }}>
+      {/* しっぽ＝はさみ（人間は無し） */}
+      {!human && (
+        <g>
+          <path d="M74 80 Q92 74 90 56" stroke={C.edge} strokeWidth="7" fill="none" strokeLinecap="round" />
+          <circle cx="88" cy="49" r="4.2" fill="none" stroke="#b8b8c0" strokeWidth="2.4" />
+          <circle cx="95" cy="52" r="4.2" fill="none" stroke="#b8b8c0" strokeWidth="2.4" />
+          <line x1="86" y1="52" x2="95" y2="44" stroke="#b8b8c0" strokeWidth="2.4" strokeLinecap="round" />
+          <line x1="92" y1="52" x2="84" y2="44" stroke="#b8b8c0" strokeWidth="2.4" strokeLinecap="round" />
+        </g>
+      )}
+      {/* からだ */}
+      <ellipse cx="50" cy="78" rx="24" ry="17" fill={C.body} stroke={C.edge} strokeWidth="2" />
+      {human && <rect x="44" y="68" width="12" height="10" fill="#5b6b8c" />/* ネクタイ風 */}
+
+      {/* 耳・髪など 種類ごと */}
+      {type === 'cat' && <g>
+        <path d="M28 30 L33 9 L46 26 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+        <path d="M72 30 L67 9 L54 26 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+        <path d="M32 26 L34 15 L41 25 Z" fill={C.inner} /><path d="M68 26 L66 15 L59 25 Z" fill={C.inner} />
+      </g>}
+      {type === 'tiger' && <g>
+        <path d="M27 31 Q26 12 40 25 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+        <path d="M73 31 Q74 12 60 25 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+        <circle cx="33" cy="22" r="3" fill={C.inner} /><circle cx="67" cy="22" r="3" fill={C.inner} />
+      </g>}
+      {type === 'dog' && <g>
+        <ellipse cx="25" cy="46" rx="9" ry="16" fill={C.ear} stroke={C.edge} strokeWidth="2" transform="rotate(-12 25 46)" />
+        <ellipse cx="75" cy="46" rx="9" ry="16" fill={C.ear} stroke={C.edge} strokeWidth="2" transform="rotate(12 75 46)" />
+      </g>}
+      {type === 'squirrel' && <g>
+        <path d="M30 28 Q28 12 42 24 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+        <path d="M70 28 Q72 12 58 24 Z" fill={C.ear} stroke={C.edge} strokeWidth="2" strokeLinejoin="round" />
+      </g>}
+
+      {/* 顔（人間は頭） */}
+      <circle cx="50" cy="44" r="27" fill={C.face} stroke={C.edge} strokeWidth="2" />
+
+      {/* トラのしま模様 */}
+      {type === 'tiger' && <g stroke="#c97b3a" strokeWidth="2" strokeLinecap="round" fill="none">
+        <path d="M50 19 L50 27" /><path d="M42 21 L44 28" /><path d="M58 21 L56 28" />
+        <path d="M26 42 Q31 43 33 45" /><path d="M74 42 Q69 43 67 45" />
+      </g>}
+
+      {/* ほっぺ（動物のみ） */}
+      {!human && <g>
+        <ellipse cx="36" cy="52" rx="5" ry="3.4" fill="#fcd3d8" opacity="0.75" />
+        <ellipse cx="64" cy="52" rx="5" ry="3.4" fill="#fcd3d8" opacity="0.75" />
+      </g>}
+
+      {/* リスのほお袋（ぷっくり） */}
+      {type === 'squirrel' && <g fill={C.face} stroke={C.edge} strokeWidth="2">
+        <circle cx="33" cy="55" r="8" /><circle cx="67" cy="55" r="8" />
+      </g>}
+
+      {/* 浪平：太くてつり上がった眉（Sっ気・きびしい顔） */}
+      {human && <g fill="#241f1b">
+        <path d="M35 41 L47 38 L47 41.5 L35 44 Z" />
+        <path d="M65 41 L53 38 L53 41.5 L65 44 Z" />
+      </g>}
+
+      {eyes[mood] || eyes.happy}
+
+      {/* 浪平：丸メガネ（黒ぶち） */}
+      {human && <g stroke="#1c1714" strokeWidth="2.3" fill="none">
+        <circle cx="41" cy="46" r="7.5" /><circle cx="59" cy="46" r="7.5" />
+        <path d="M48.5 45 Q50 47 51.5 45" />
+        <line x1="33.6" y1="44" x2="26" y2="41" /><line x1="66.4" y1="44" x2="74" y2="41" />
+      </g>}
+
+      {/* はな */}
+      {human
+        ? <ellipse cx="50" cy="51" rx="3" ry="3.8" fill="#d99a78" />
+        : <path d="M48.5 50 L51.5 50 L50 52 Z" fill="#e58a96" />}
+
+      {/* 浪平：立派なカイゼルひげ */}
+      {human && <path d="M38 56 Q44 54 50 57 Q56 54 62 56 Q57 61 50 58.5 Q43 61 38 56 Z" fill="#241f1b" />}
+      {mouth}
+
+      {/* ひげ（動物） or 浪平：黒い横髪＋てっぺんの一本毛 */}
+      {!human ? (
+        <g stroke={C.whisk} strokeWidth="1.4" strokeLinecap="round">
+          <line x1="20" y1="46" x2="33" y2="48" /><line x1="20" y1="52" x2="33" y2="52" />
+          <line x1="80" y1="46" x2="67" y2="48" /><line x1="80" y1="52" x2="67" y2="52" />
+        </g>
+      ) : (
+        <g>
+          {/* 横〜後ろの黒髪（ハゲ頭のまわり） */}
+          <path d="M26 28 Q19 44 27 59 Q21 56 19 47 Q17 35 26 28 Z" fill="#241f1b" />
+          <path d="M74 28 Q81 44 73 59 Q79 56 81 47 Q83 35 74 28 Z" fill="#241f1b" />
+          {/* もみあげ */}
+          <path d="M28 50 Q27 58 31 62" stroke="#241f1b" strokeWidth="3" fill="none" strokeLinecap="round" />
+          <path d="M72 50 Q73 58 69 62" stroke="#241f1b" strokeWidth="3" fill="none" strokeLinecap="round" />
+          {/* てっぺんの一本毛 */}
+          <path d="M50 18 C49 9 56 8 52 2" stroke="#241f1b" strokeWidth="2.6" fill="none" strokeLinecap="round" />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// キャラごとの性格セリフ。状況×動物で出し分け（憎めない感じに）
+const MASCOT_LINES = {
+  // 猫：スタンダードなやさしいタメ口
+  cat: {
+    empty:   { mood: 'think', text: 'まだ記録がないにゃ。まずは今日の売上、入れてみよ？かんたんだよ〜' },
+    loss:    { mood: 'worry', text: 'うーん、今月はちょっと赤字かも…。あせらず、いっしょに見直そっか。' },
+    tight:   { mood: 'worry', text: '暮らしのお金、ちょっとカツカツにゃ。固定費をのぞいてみよ？' },
+    onTrack: { mood: 'cheer', text: 'このペースなら今年の目標いけるにゃ！その調子〜✨' },
+    safe:    { mood: 'cheer', text: '今月もいい感じ！ちゃんとお金、残ってるにゃ。えらい！' },
+    base:    { mood: 'happy', text: 'おつかれさま！今日も記録できたね。コツコツがいちばんにゃ。' },
+  },
+  // 犬：無邪気で元気いっぱいの子犬
+  dog: {
+    empty:   { mood: 'happy', text: 'わーい！なにか入れるの！？さいしょの売上おしえて〜わんっ！' },
+    loss:    { mood: 'worry', text: 'あれれ、赤字わん…？でもでも、ボクついてる！いっしょにがんばろっ！' },
+    tight:   { mood: 'worry', text: 'むむっ、お金きびしいわん。むだなとこ、いっしょにさがそ！' },
+    onTrack: { mood: 'cheer', text: 'すごいすごい！このままで目標いけちゃうわん！✨' },
+    safe:    { mood: 'cheer', text: 'やったね！今月バッチリわん！なでてなで〜！' },
+    base:    { mood: 'happy', text: 'きょうも記録できたね！えらいえらい、わんっ！' },
+  },
+  // トラ：強気で熱血な体育会系コーチ
+  tiger: {
+    empty:   { mood: 'happy', text: 'よし、いくぞ！まずは今日の数字を入れてみろ、がおーっ！' },
+    loss:    { mood: 'worry', text: 'むっ、赤字か…！だが諦めるな、ここから巻き返すぞ、がおっ！' },
+    tight:   { mood: 'worry', text: 'ふんばりどころだ！ムダを削って立て直すぞ、がおっ！' },
+    onTrack: { mood: 'cheer', text: 'いいぞ、その調子だ！目標は目前、突っ走れェ、がおーっ！' },
+    safe:    { mood: 'cheer', text: 'よくやった！今月は上出来だ、勢いを止めるな、がおっ！' },
+    base:    { mood: 'happy', text: '今日もよく記録した！継続は力なり、だ。がおっ！' },
+  },
+  // リス：臆病で心配性。でもけなげで可愛い
+  squirrel: {
+    empty:   { mood: 'think', text: 'あ、あの…よかったら今日の売上、入れてみませんか…ちゅん…' },
+    loss:    { mood: 'worry', text: 'ひぃっ、赤字です…ど、どうしましょう…お、落ち着いて、ね…ちゅん' },
+    tight:   { mood: 'worry', text: 'お金が心配で夜も眠れないちゅん…す、少しずつ見直しましょ…' },
+    onTrack: { mood: 'cheer', text: 'ほ、ほんとに…？目標、いけそう…！よ、よかった…ちゅん！' },
+    safe:    { mood: 'cheer', text: 'あぁ、よかった…今月は、ひと安心です…ちゅん…ほっ' },
+    base:    { mood: 'happy', text: 'き、今日も記録できましたね…えらい、です…ちゅん' },
+  },
+  // 浪平：Sっ気オヤジ。ケツを叩いて発破をかける（でも憎めない）
+  namihei: {
+    empty:   { mood: 'think', text: 'なんじゃ、まだ何も入れとらんのか！さっさと今日の売上を書かんか、じゃ！' },
+    loss:    { mood: 'worry', text: 'バカモーン！赤字とは何事だ！気を引き締めて立て直さんか、じゃ！' },
+    tight:   { mood: 'worry', text: 'ぜいたくが過ぎるんじゃ！ムダな出費、今すぐ見直せ、じゃ！' },
+    onTrack: { mood: 'cheer', text: 'ほう、やればできるではないか。だが油断するな、まだ上を目指せ、じゃ！' },
+    safe:    { mood: 'cheer', text: 'フン、まあ及第点じゃ。気を抜くと一気に落ちるぞ、精進せい！' },
+    base:    { mood: 'happy', text: '記録したか。当然じゃ、毎日続けてこそ一人前じゃ！' },
+  },
+};
+
+function mascotTalk(s, m) {
+  const lines = MASCOT_LINES[s.settings.mascotType] || MASCOT_LINES.cat;
+  if (m.dayCount === 0) return lines.empty;
+  if (m.operatingProfit < 0) return lines.loss;
+  if (m.monthlySavingCapacity < 0) return lines.tight;
+  if (m.monthsWithData > 0 && m.planForecastVsTarget >= 1) return lines.onTrack;
+  if (m.safetyMargin > 0.2) return lines.safe;
+  return lines.base;
+}
+
+function MascotGreeting({ s, m }) {
+  const t = mascotTalk(s, m);
+  return (
+    <div className="flex items-end gap-3">
+      <div className="shrink-0 bg-white rounded-full p-1 shadow-soft">
+        <Mascot type={s.settings.mascotType} size={64} mood={t.mood} />
+      </div>
+      <div className="relative bg-white rounded-2xl rounded-bl-sm shadow-soft px-4 py-3 text-stone-600 text-sm flex-1">
+        <span className="absolute -left-2 bottom-3 w-3 h-3 bg-white rotate-45" />
+        {t.text}
+      </div>
+    </div>
+  );
+}
+
+// 各タブの見出しに出る、相棒のミニ案内
+const TAB_HINTS = {
+  sales:   { mood: 'happy', text: '売上と客数だけでOK。毎日ちょこっと続けるのがコツだよ' },
+  plan:    { mood: 'cheer', text: '1年の目標を12コに分けるだけ。ムリないペースにしよ' },
+  monthly: { mood: 'happy', text: '月末にここを見れば、今月のがんばりが丸わかり' },
+  cost:    { mood: 'think', text: '毎月かかるお金とお給料を入れてね。途中入社もOKだよ' },
+  living:  { mood: 'happy', text: '暮らしのお金を入れると、毎月いくら貯められるか見えるよ' },
+  receipt: { mood: 'cheer', text: 'レシートはためずにパシャ！科目もえらべるよ' },
+  tax:     { mood: 'think', text: '確定申告の下ごしらえ。むずかしくないよ、いっしょに' },
+  expand:  { mood: 'cheer', text: 'お店をふやす夢、いくら必要か逆算してみよ' },
+  loan:    { mood: 'happy', text: '借入れの返済、毎月いくらかシミュレーションできるよ' },
+};
+
+function TabHint({ type, tab }) {
+  const h = TAB_HINTS[tab];
+  if (!h) return null;
+  return (
+    <div className="flex items-center gap-2.5 mb-4">
+      <div className="shrink-0"><Mascot type={type} size={40} mood={h.mood} /></div>
+      <div className="relative bg-white rounded-2xl rounded-bl-sm shadow-soft px-3.5 py-2 text-stone-500 text-sm">
+        <span className="absolute -left-1.5 bottom-2.5 w-2.5 h-2.5 bg-white rotate-45" />
+        {h.text}
+      </div>
+    </div>
+  );
+}
+
+// きせかえ：相棒をえらぶ
+function MascotPicker({ s, setS }) {
+  const cur = s.settings.mascotType;
+  return (
+    <Card className="p-4">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-sm font-bold text-stone-600">あいぼうを えらぶ</span>
+        <span className="text-xs text-stone-400">タップで きせかえ</span>
+      </div>
+      <div className="flex gap-2 overflow-x-auto pb-1">
+        {MASCOT_ORDER.map((t) => (
+          <button key={t} onClick={() => setS({ ...s, settings: { ...s.settings, mascotType: t } })}
+            className={'shrink-0 rounded-2xl p-1.5 border-2 transition-all ' + (cur === t ? 'border-rose-300 bg-peach scale-105' : 'border-transparent bg-stone-50')}>
+            <Mascot type={t} size={48} mood="happy" />
+            <div className={'text-xs font-bold mt-0.5 ' + (cur === t ? 'text-rose-400' : 'text-stone-400')}>{MASCOTS[t].label}</div>
+          </button>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+/* ============================================================
+   今月の黒字メーター（積み上げ式・目指せそうに）
+   ============================================================ */
+function BreakEvenMeter({ m }) {
+  const be = m.breakEvenSales || 1;
+  const trackMax = be * 1.25;
+  const fillPct = clamp((m.thisMonthNet / trackMax) * 100, m.thisMonthNet > 0 ? 4 : 0, 100);
+  const bePct = clamp((be / trackMax) * 100, 0, 100);
+  return (
+    <div>
+      {/* メーター */}
+      <div className="relative h-10 bg-stone-100 rounded-full overflow-hidden">
+        <div className={'h-full rounded-full transition-all duration-500 ' + (m.beReached ? 'bg-gradient-to-r from-emerald-300 to-emerald-400' : 'bg-gradient-to-r from-rose-200 to-rose-300')}
+          style={{ width: fillPct + '%' }}>
+          {m.thisMonthNet > 0 && <span className="absolute inset-y-0 left-3 flex items-center text-xs font-extrabold text-white tabnum">{man(m.thisMonthNet)}</span>}
+        </div>
+        {/* 黒字ライン */}
+        <div className="absolute inset-y-0 flex flex-col items-center" style={{ left: bePct + '%' }}>
+          <div className="w-0.5 h-full bg-stone-500" />
+        </div>
+        <div className="absolute -top-0.5 text-[10px] font-bold text-stone-500" style={{ left: `calc(${bePct}% + 4px)` }}>黒字ライン</div>
+      </div>
+      <div className="flex justify-between mt-2 text-xs text-stone-400">
+        <span>今月の売上 <b className="tabnum text-stone-600">{man(m.thisMonthNet)}</b>（税ぬき）</span>
+        <span>黒字ライン <b className="tabnum text-stone-600">{man(m.breakEvenSales)}</b></span>
+      </div>
+      {/* ひとこと（目指せそうに） */}
+      <div className={'mt-3 rounded-2xl p-4 text-sm font-bold ' + (m.beReached ? 'bg-emerald-50 text-emerald-700' : 'bg-peach text-rose-500')}>
+        {m.thisMonthNet === 0 ? (
+          <span>今月はこれから！売上を入れると、黒字までの道のりが見えるよ 🐾</span>
+        ) : m.beReached ? (
+          <span>🎉 今月はもう黒字！いま <span className="tabnum">+{man(m.beSurplus)}</span> のプラス。ナイス！</span>
+        ) : (
+          <span>黒字まで あと <span className="tabnum text-base">{man(m.beRemaining)}</span>！<br />
+            <span className="text-stone-500 font-medium">のこり{m.remainingOpenDays}日なら、1日 約 <b className="text-rose-500 tabnum">{yen(Math.round(m.perDayToBE / 100) * 100)}</b> 売れば届くよ 💪</span>
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   数字のつながり（どこから来てるの？）
+   ============================================================ */
+function FlowChain({ m }) {
+  const Box = ({ label, val, tone, from }) => {
+    const tones = { sky: 'bg-sky-50 text-sky-600', blue: 'bg-sky-50 text-sky-600', rose: 'bg-rose-50 text-rose-500', emerald: 'bg-emerald-50 text-emerald-600', violet: 'bg-blush text-rose-400' };
+    return (
+      <div className={'shrink-0 rounded-2xl px-3 py-2 text-center ' + (tones[tone] || tones.sky)}>
+        <div className="text-[11px] font-bold opacity-80">{label}</div>
+        <div className="text-sm font-extrabold tabnum">{val}</div>
+        {from && <div className="text-[10px] opacity-60 mt-0.5">{from}</div>}
+      </div>
+    );
+  };
+  const Arrow = ({ op }) => (
+    <div className="shrink-0 flex flex-col items-center text-stone-300 px-0.5">
+      <span className="text-lg leading-none">→</span>
+      {op && <span className="text-[10px] font-bold text-stone-400">{op}</span>}
+    </div>
+  );
+  return (
+    <Card className="p-4">
+      <h3 className="font-bold text-stone-600 text-sm mb-3">数字のつながり 🔗 <span className="text-stone-400 font-normal">— どこから来てるの？</span></h3>
+      <div className="flex items-center gap-1 overflow-x-auto pb-1">
+        <Box label="毎日入力" val="売上＋客数" tone="sky" from="毎日タブ" />
+        <Arrow op="今月ぶん合計" />
+        <Box label="今月の売上" val={man(m.thisMonthNet)} tone="blue" />
+        <Arrow op="−費用" />
+        <Box label="お店の費用" val={'−' + man(m.fixedCost + m.thisMonthNet * m.variableRate)} tone="rose" from="費用タブ" />
+        <Arrow op="＝" />
+        <Box label="今月のもうけ" val={man(m.thisMonthProfit)} tone="emerald" />
+        <Arrow op="つみあげ" />
+        <Box label="今年のもうけ" val={man(m.ytdProfit)} tone="violet" />
+      </div>
+      <p className="text-[11px] text-stone-400 mt-2">※毎日入れるほど「今月のもうけ」が育ち、それが「今年のもうけ」に積み上がります。月ごとの集計は「月のまとめ」、申告用の年間集計は「税金・申告」で見られます。</p>
+    </Card>
+  );
+}
+
+/* ============================================================
+   はじめの3ステップ（番号でなぞる順番ガイド）
+   ============================================================ */
+function StartGuide({ s, m, visited, goTab }) {
+  const hasClosed = (s.settings.closedWeekdays && s.settings.closedWeekdays.length > 0) || (s.current.closedDays && s.current.closedDays.length > 0);
+  const steps = [
+    { n: 1, tab: 'cost', title: 'お店の費用を入れる', desc: '家賃・お給料・材料費をざっくり', cta: '設定する', done: visited.has('cost') },
+    { n: 2, tab: 'sales', title: '定休日・お休みを入れる', desc: 'カレンダーで毎週の定休日や臨時休業を', cta: '入れる', done: hasClosed },
+    { n: 3, tab: 'sales', title: '今日の売上を入れる', desc: '売上と客数だけでOK', cta: '入力する', done: m.dayCount > 0 },
+    { n: 4, tab: 'plan', title: '1年の目標を決める', desc: '月ごとの目標を作る', cta: '決める', done: visited.has('plan') },
+  ];
+  const doneCount = steps.filter((x) => x.done).length;
+  if (doneCount === steps.length) return null; // 全部終わったら隠す
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="font-bold text-stone-600">はじめの4ステップ 🐾</h3>
+        <span className="text-xs text-stone-400 font-bold">{doneCount}/4 完了</span>
+      </div>
+      <p className="text-sm text-stone-400 mb-4">この順番でなぞれば、ホームの数字がぜんぶ動き出すよ</p>
+      <div className="space-y-2.5">
+        {steps.map((st) => (
+          <div key={st.n} className={'flex items-center gap-3 rounded-2xl p-3 border ' + (st.done ? 'border-emerald-100 bg-emerald-50' : 'border-stone-100')}>
+            <div className={'w-9 h-9 rounded-full flex items-center justify-center font-extrabold shrink-0 ' + (st.done ? 'bg-emerald-400 text-white' : 'bg-rose-400 text-white')}>
+              {st.done ? '✓' : st.n}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="font-bold text-stone-700 text-sm">{st.title}</div>
+              <div className="text-xs text-stone-400">{st.desc}</div>
+            </div>
+            {st.done
+              ? <span className="text-xs font-bold text-emerald-500 shrink-0">できた！</span>
+              : <button onClick={() => goTab(st.tab)} className="shrink-0 bg-rose-400 hover:bg-rose-500 text-white text-sm font-bold px-4 py-2 rounded-full">{st.cta} →</button>}
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+/* ============================================================
+   タブ：ダッシュボード
+   ============================================================ */
+function Dashboard({ s, setS, m, visited, goTab }) {
+  // 今月のもうけ：マイナスは大きく出さず、0で止めて実額は小さく表示
+  const tmProfit = m.thisMonthProfit;
+  const tmSub = tmProfit >= 0 ? '今月の黒字ぶん' : `（${man(tmProfit)}）あと少しで黒字！`;
+  // 今年のもうけ：積み上げカウンター（アニメ）
+  const ytdAnim = useCountUp(Math.max(0, m.ytdProfit));
+  return (
+    <div className="space-y-4">
+      <MascotGreeting s={s} m={m} />
+      <StartGuide s={s} m={m} visited={visited} goTab={goTab} />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KPI label="毎月の売上（平均）" value={man(m.monthlySales)} sub="「毎日入力」から自動集計" tone="blue" big />
+        <KPI label="今月のもうけ" value={man(Math.max(0, tmProfit))} sub={tmSub} tone={tmProfit >= 0 ? 'green' : 'slate'} big />
+        <KPI label="今ある お金" value={man(s.current.cashOnHand)} sub="「お店の費用」で設定" tone="violet" big />
+        <KPI label="今年のもうけ つみあげ" value={man(ytdAnim)} sub={m.ytdMonths > 0 ? m.ytdMonths + 'ヶ月ぶん 積み上げ中' : 'まだこれから'} tone="green" big />
+      </div>
+
+      <FlowChain m={m} />
+
+      {m.dayCount > 0 && (
+        <div className="grid grid-cols-3 gap-3">
+          <KPI label="お客さま1人あたり" value={yen(m.avgSpend)} sub={'1日 ' + m.avgCustomersPerDay.toFixed(1) + '人くらい'} tone="red" />
+          <KPI label="1時間あたりの売上" value={yen(m.hourlyNet)} sub={'1日' + s.settings.businessHoursPerDay + '時間で計算'} tone="sky" />
+          <KPI label="1日の売上（平均）" value={yen(m.dailyAvgGross)} sub={m.dayCount + '日ぶんの記録'} tone="amber" />
+        </div>
+      )}
+
+      <div className="grid md:grid-cols-3 gap-4">
+        <Card className="p-5 md:col-span-2">
+          <h3 className="font-bold text-stone-600 mb-3">今月の黒字メーター</h3>
+          <BreakEvenMeter m={m} />
+        </Card>
+
+        <div className="space-y-3">
+          <KPI label="黒字ライン（今月）" value={man(m.breakEvenSales)} sub="ここを超えればプラス" tone="amber" />
+          <KPI label="今月の売上（税ぬき）" value={man(m.thisMonthNet)} sub={m.thisMonthDays + '日ぶん 入力ずみ'} tone="blue" />
+          <KPI label="毎月かならずかかるお金" value={man(m.fixedCost)} sub={'うち お給料 ' + man(m.laborCost)} tone="slate" />
+        </div>
+      </div>
+
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-3">お金のうちわけ（毎月）</h3>
+        <Waterfall m={m} />
+      </Card>
+
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-stone-600">毎月 手もとに残るお金</h3>
+          <span className="text-xs bg-peach text-rose-400 rounded-full px-3 py-1 font-bold">{s.settings.businessType}</span>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <KPI label="もうけ（月）" value={man(m.operatingProfit)} tone="blue" />
+          <KPI label="だいたいの税金（月）" value={man(m.taxMonthly)} sub="1年の税金÷12" tone="amber" />
+          {m.isSole
+            ? <KPI label="生活費（月）" value={man(m.livingMonthly)} tone="red" />
+            : <KPI label="手取り（月）" value={man(m.netMonthly)} tone="slate" />}
+          <KPI label="毎月 貯められるお金" value={man(m.monthlySavingCapacity)} sub="お店をふやす元手" tone={m.monthlySavingCapacity >= 0 ? 'green' : 'red'} />
+        </div>
+      </Card>
+
+      <MascotPicker s={s} setS={setS} />
+    </div>
+  );
+}
+
+/* 収益構造のウォーターフォール風バー */
+function Waterfall({ m }) {
+  const base = m.monthlySales || 1;
+  const items = [
+    { label: '売上', val: m.monthlySales, tone: 'sky' },
+    { label: '材料など（売れた分）', val: m.variableCost, tone: 'rose' },
+    { label: 'お給料', val: m.laborCost, tone: 'rose' },
+    { label: '家賃など毎月の費用', val: m.fixedCost - m.laborCost, tone: 'rose' },
+    { label: 'のこるお金（もうけ）', val: m.operatingProfit, tone: m.operatingProfit >= 0 ? 'emerald' : 'rose' },
+  ];
+  const colorMap = { sky: 'bg-sky-400', rose: 'bg-rose-400', emerald: 'bg-emerald-500' };
+  return (
+    <div className="space-y-2">
+      {items.map((it, i) => (
+        <div key={i} className="flex items-center gap-3">
+          <div className="w-32 text-sm text-stone-500 shrink-0">{it.label}</div>
+          <div className="flex-1 bg-stone-100 rounded h-7 overflow-hidden">
+            <div className={'h-full ' + colorMap[it.tone] + ' flex items-center justify-end px-2 transition-all'}
+              style={{ width: clamp(Math.abs(it.val) / base * 100, 2, 100) + '%' }}>
+              <span className="text-xs text-white font-semibold tabnum whitespace-nowrap">{man(it.val)}</span>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：売上（毎日の入力が主役）
+   ============================================================ */
+function MiniStat({ label, value, tone = 'stone' }) {
+  const t = { stone: 'text-stone-700', rose: 'text-rose-400', emerald: 'text-emerald-500', sky: 'text-sky-500' };
+  return (
+    <div className="text-center">
+      <div className="text-[11px] text-stone-400">{label}</div>
+      <div className={'text-lg font-extrabold tabnum ' + t[tone]}>{value}</div>
+    </div>
+  );
+}
+
+// 日別カレンダー（売上ひと目＋休業日の管理＝月のまとめ・来月の準備）
+function SalesCalendar({ entries, today, onPick, closedDays, closedWeekdays, onToggleClosed, onToggleWeekday }) {
+  const [calMonth, setCalMonth] = useState(ym(today));
+  const [mode, setMode] = useState('sales'); // 'sales' | 'closed'
+  const [cy, cm] = calMonth.split('-').map(Number);
+  const startWday = new Date(cy, cm - 1, 1).getDay();
+  const daysInMonth = new Date(cy, cm, 0).getDate();
+  const byDate = {}, byCust = {};
+  entries.forEach((x) => { byDate[x.date] = (x.gross != null ? x.gross : x.amount) || 0; byCust[x.date] = x.customers || 0; });
+  const short = (n) => (n >= 10000 ? (Math.round(n / 1000) / 10).toString().replace(/\.0$/, '') + '万' : String(Math.round(n)));
+  const shiftMonth = (delta) => { const dt = new Date(cy, cm - 1 + delta, 1); setCalMonth(`${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`); };
+  const isClosed = (ds, wday) => closedDays.includes(ds) || closedWeekdays.includes(wday);
+  const wd = ['日', '月', '火', '水', '木', '金', '土'];
+  const cells = [];
+  for (let i = 0; i < startWday; i++) cells.push(null);
+  for (let dd = 1; dd <= daysInMonth; dd++) cells.push(dd);
+  // 当月集計
+  let monthTotal = 0, monthCust = 0, workDays = 0, closedCount = 0;
+  for (let dd = 1; dd <= daysInMonth; dd++) {
+    const ds = `${calMonth}-${String(dd).padStart(2, '0')}`;
+    const wday = new Date(cy, cm - 1, dd).getDay();
+    if (byDate[ds] != null) { monthTotal += byDate[ds]; monthCust += byCust[ds] || 0; workDays++; }
+    else if (isClosed(ds, wday)) closedCount++;
+  }
+  // 先月の合計（比較用）
+  const prevDt = new Date(cy, cm - 2, 1);
+  const prevKey = `${prevDt.getFullYear()}-${String(prevDt.getMonth() + 1).padStart(2, '0')}`;
+  let prevTotal = 0, prevCust = 0;
+  entries.forEach((x) => { if (x.date.slice(0, 7) === prevKey) { prevTotal += (x.gross != null ? x.gross : x.amount) || 0; prevCust += x.customers || 0; } });
+  const diff = (now, prev) => { const d = now - prev; return d === 0 ? '±0' : (d > 0 ? '+' : '') + d; };
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-1">
+        <button onClick={() => shiftMonth(-1)} className="w-7 h-7 rounded-full bg-stone-100 text-stone-500 font-bold text-sm">‹</button>
+        <div className="text-center">
+          <div className="font-bold text-stone-600 text-sm">{cy}年{cm}月</div>
+          <div className="text-[11px] text-stone-400">営業{workDays}日 ・ 休み{closedCount}日</div>
+        </div>
+        <button onClick={() => shiftMonth(1)} className="w-7 h-7 rounded-full bg-stone-100 text-stone-500 font-bold text-sm">›</button>
+      </div>
+
+      {/* 合計と先月比較 */}
+      <div className="grid grid-cols-2 gap-2 mb-1">
+        <div className="bg-peach rounded-xl px-3 py-2 text-center">
+          <div className="text-[10px] text-stone-400">売上計（税込）</div>
+          <div className="font-extrabold text-rose-400 tabnum text-sm">{man(monthTotal)}</div>
+          <div className="text-[10px] text-stone-400">先月 {man(prevTotal)}</div>
+        </div>
+        <div className="bg-sky-50 rounded-xl px-3 py-2 text-center">
+          <div className="text-[10px] text-stone-400">客数計</div>
+          <div className="font-extrabold text-sky-500 tabnum text-sm">{monthCust}人 <span className={'text-[10px] ' + (monthCust - prevCust >= 0 ? 'text-emerald-500' : 'text-rose-400')}>({diff(monthCust, prevCust)})</span></div>
+          <div className="text-[10px] text-stone-400">先月 {prevCust}人</div>
+        </div>
+      </div>
+
+      {/* タップの動作モード */}
+      <div className="flex gap-1 bg-stone-100 rounded-full p-1 my-2 text-xs">
+        <button onClick={() => setMode('sales')} className={'flex-1 py-1.5 rounded-full font-bold ' + (mode === 'sales' ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-400')}>売上を入力</button>
+        <button onClick={() => setMode('closed')} className={'flex-1 py-1.5 rounded-full font-bold ' + (mode === 'closed' ? 'bg-white text-stone-500 shadow-soft' : 'text-stone-400')}>お休みにする</button>
+      </div>
+
+      <div className="max-w-[20rem] mx-auto">
+        <div className="grid grid-cols-7 gap-0.5 mb-0.5">
+          {wd.map((w, i) => <div key={i} className={'text-center text-[9px] font-bold ' + (i === 0 ? 'text-rose-400' : i === 6 ? 'text-sky-400' : 'text-stone-400')}>{w}</div>)}
+        </div>
+        <div className="grid grid-cols-7 gap-0.5">
+          {cells.map((dd, i) => {
+            if (!dd) return <div key={i} />;
+            const ds = `${calMonth}-${String(dd).padStart(2, '0')}`;
+            const wday = (startWday + dd - 1) % 7;
+            const amt = byDate[ds];
+            const closed = amt == null && isClosed(ds, wday);
+            const isToday = ds === today;
+            const onClick = () => (mode === 'closed' ? onToggleClosed(ds) : onPick(ds));
+            return (
+              <button key={i} onClick={onClick}
+                className={'aspect-square rounded-md flex flex-col items-center justify-center border transition-colors ' +
+                  (amt != null ? 'bg-peach border-rose-100' : closed ? 'bg-stone-200 border-transparent' : 'bg-stone-50 border-transparent hover:bg-stone-100') +
+                  (isToday ? ' ring-2 ring-rose-300' : '')}>
+                <span className={'text-[9px] leading-none ' + (wday === 0 ? 'text-rose-400' : wday === 6 ? 'text-sky-400' : 'text-stone-400')}>{dd}</span>
+                {amt != null
+                  ? <>
+                      <span className="text-[9px] font-bold text-rose-500 tabnum leading-none mt-0.5">{short(amt)}</span>
+                      {byCust[ds] > 0 && <span className="text-[8px] text-sky-500 tabnum leading-none">{byCust[ds]}人</span>}
+                    </>
+                  : closed ? <span className="text-[8px] text-stone-400 leading-none mt-0.5">休</span> : null}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 定休日（曜日） */}
+      <div className="mt-3 border-t border-stone-100 pt-3">
+        <div className="text-[11px] text-stone-400 mb-1.5 text-center">毎週の定休日（タップで設定）</div>
+        <div className="flex gap-1 justify-center">
+          {wd.map((w, i) => (
+            <button key={i} onClick={() => onToggleWeekday(i)}
+              className={'w-8 h-8 rounded-full text-xs font-bold transition-colors ' + (closedWeekdays.includes(i) ? 'bg-stone-400 text-white' : 'bg-stone-100 text-stone-400')}>
+              {w}
+            </button>
+          ))}
+        </div>
+      </div>
+      <p className="text-[10px] text-stone-400 mt-2 text-center">
+        {mode === 'sales' ? '日付をタップ → その日の売上を入力・修正' : '日付をタップ → 臨時休業のオン/オフ'}
+      </p>
+    </Card>
+  );
+}
+
+function SalesTab({ s, setS, m }) {
+  const c = s.current;
+  const g = s.settings;
+  const up = (patch) => setS({ ...s, current: { ...c, ...patch } });
+  const upG = (patch) => setS({ ...s, settings: { ...g, ...patch } });
+  const today = new Date().toISOString().slice(0, 10);
+  const [d, setD] = useState({ date: today, gross: '', customers: '' });
+  const [showSettings, setShowSettings] = useState(false);
+
+  // 入力中のライブ計算
+  const gross = parseFloat(d.gross) || 0;
+  const customers = parseFloat(d.customers) || 0;
+  const net = gross / (1 + (g.taxRate || 0));
+  const tax = gross - net;
+  const spend = customers ? gross / customers : 0;
+  const hourly = g.businessHoursPerDay ? net / g.businessHoursPerDay : 0;
+
+  const save = () => {
+    if (!gross) return;
+    const without = c.dailySales.filter((x) => x.date !== d.date); // 同日があれば上書き
+    up({ dailySales: [...without, { date: d.date, gross, customers }].sort((a, b) => a.date.localeCompare(b.date)) });
+    setD({ date: today, gross: '', customers: '' });
+  };
+  const delLog = (date) => up({ dailySales: c.dailySales.filter((x) => x.date !== date) });
+  // カレンダーで日付タップ → その日を上の入力欄に読み込む
+  const pickDate = (ds) => {
+    const ex = c.dailySales.find((x) => x.date === ds);
+    setD({ date: ds, gross: ex ? String((ex.gross != null ? ex.gross : ex.amount) || '') : '', customers: ex && ex.customers ? String(ex.customers) : '' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  // 臨時休業のオン/オフ
+  const toggleClosed = (ds) => {
+    const set = c.closedDays || [];
+    up({ closedDays: set.includes(ds) ? set.filter((x) => x !== ds) : [...set, ds] });
+  };
+  // 定休日（曜日）のオン/オフ
+  const toggleWeekday = (i) => {
+    const set = g.closedWeekdays || [];
+    upG({ closedWeekdays: set.includes(i) ? set.filter((x) => x !== i) : [...set, i] });
+  };
+
+  // 今月の集計
+  const thisMonth = ym(today);
+  const monthRows = c.dailySales.filter((x) => ym(x.date) === thisMonth);
+  const monthGross = monthRows.reduce((a, x) => a + ((x.gross != null ? x.gross : x.amount) || 0), 0);
+  const monthCust = monthRows.reduce((a, x) => a + (x.customers || 0), 0);
+
+  return (
+    <div className="space-y-4">
+      {/* 今日の入力（ヒーロー） */}
+      <Card className="p-5 bg-gradient-to-br from-white to-peach">
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-extrabold text-rose-400 text-xl">今日のぶん、入力しよう！</h3>
+          <input type="date" value={d.date} onChange={(e) => setD({ ...d, date: e.target.value })}
+            className="border-2 border-stone-100 bg-white rounded-xl px-3 py-1.5 text-sm" />
+        </div>
+        <p className="text-sm text-stone-400 mb-4">入れるのは <b className="text-rose-400">売上</b> と <b className="text-rose-400">客数</b> だけ。あとは自動で計算します ☺️</p>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">税込の売上</span>
+            <div className="mt-1.5 flex items-center rounded-2xl border-2 border-rose-200 bg-peach focus-within:border-rose-400 transition-colors overflow-hidden">
+              <span className="pl-4 text-2xl text-rose-300 font-bold">¥</span>
+              <input type="number" inputMode="numeric" value={d.gross} placeholder="0" step={1000}
+                onChange={(e) => setD({ ...d, gross: e.target.value })}
+                className="w-full px-2 py-3 outline-none tabnum text-right text-3xl font-extrabold text-stone-700 bg-transparent" />
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">客数</span>
+            <div className="mt-1.5 flex items-center rounded-2xl border-2 border-stone-100 bg-stone-50 focus-within:border-rose-300 transition-colors overflow-hidden">
+              <input type="number" inputMode="numeric" value={d.customers} placeholder="0" step={1}
+                onChange={(e) => setD({ ...d, customers: e.target.value })}
+                className="w-full px-4 py-3 outline-none tabnum text-right text-3xl font-extrabold text-stone-700 bg-transparent" />
+              <span className="pr-4 text-lg text-stone-300 font-bold">人</span>
+            </div>
+          </label>
+        </div>
+
+        {/* ライブ計算プレビュー */}
+        <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-2 bg-stone-50 rounded-2xl p-3">
+          <MiniStat label="税ぬきの売上" value={gross ? yen(net) : '—'} tone="emerald" />
+          <MiniStat label={'消費税(' + Math.round((g.taxRate || 0) * 100) + '%)'} value={gross ? yen(tax) : '—'} tone="stone" />
+          <MiniStat label="お客さま1人あたり" value={customers ? yen(spend) : '—'} tone="rose" />
+          <MiniStat label="1時間あたり" value={gross ? yen(hourly) : '—'} tone="sky" />
+        </div>
+
+        <button onClick={save} disabled={!gross}
+          className={'mt-4 w-full py-4 rounded-2xl font-extrabold text-white text-lg transition-all ' + (gross ? 'bg-rose-400 hover:bg-rose-500 active:scale-[0.99]' : 'bg-stone-200 cursor-not-allowed')}>
+          {monthRows.some((x) => x.date === d.date) ? 'この日を上書き保存' : '保存する'} ✓
+        </button>
+
+        {/* かんたん設定（折りたたみ） */}
+        <button onClick={() => setShowSettings(!showSettings)} className="mt-3 text-xs text-stone-400 hover:text-rose-400">
+          {showSettings ? '▲ 設定を閉じる' : '▼ 消費税率・営業時間などの設定'}
+        </button>
+        {showSettings && (
+          <div className="mt-3 grid sm:grid-cols-3 gap-4 border-t border-stone-100 pt-3">
+            <PercentField label="消費税率" value={g.taxRate} onChange={(v) => upG({ taxRate: v })} step={1} hint="税込→税別の仕分けに使用" />
+            <Field label="1日の営業時間" value={g.businessHoursPerDay} onChange={(v) => upG({ businessHoursPerDay: v })} unit="時間" step={0.5} hint="時間単価の算出に使用" />
+            <Field label="月の営業日数" value={c.openDaysPerMonth} onChange={(v) => up({ openDaysPerMonth: v })} unit="日" step={1} hint="月商見込みの換算に使用" />
+            <PercentField label="その他変動費率" value={c.otherVariableRate} onChange={(v) => up({ otherVariableRate: v })} step={1} hint="カード手数料など（材料費は「お店の費用」で設定）" />
+            <label className="block">
+              <span className="text-sm text-stone-500 font-medium">売上の入れ方</span>
+              <div className="mt-1.5 flex gap-1 bg-stone-100 rounded-xl p-1">
+                <button onClick={() => up({ useLog: true })} className={'flex-1 py-1.5 rounded-lg text-xs font-bold ' + (c.useLog ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-400')}>毎日入力</button>
+                <button onClick={() => up({ useLog: false })} className={'flex-1 py-1.5 rounded-lg text-xs font-bold ' + (!c.useLog ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-400')}>月商を直接</button>
+              </div>
+            </label>
+            {!c.useLog && <Field label="月商（税別）" value={c.monthlySales} onChange={(v) => up({ monthlySales: v })} step={10000} />}
+          </div>
+        )}
+      </Card>
+
+      {/* 今月のサマリー */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KPI label="今月の売上(税別)" value={man(monthGross / (1 + (g.taxRate || 0)))} sub={monthRows.length + '日入力済み'} tone="blue" big />
+        <KPI label="今月の客数" value={monthCust + '人'} sub={monthRows.length ? '1日平均 ' + (monthCust / monthRows.length).toFixed(1) + '人' : ''} tone="violet" big />
+        <KPI label="平均 客単価(税込)" value={monthCust ? yen(monthGross / monthCust) : '—'} tone="red" big />
+        <KPI label="月商見込み(税別)" value={man(m.salesFromLog)} sub={'平均×' + c.openDaysPerMonth + '日'} tone="green" big />
+      </div>
+
+      {/* 日別カレンダー（売上＋休業日の管理） */}
+      <SalesCalendar entries={c.dailySales} today={today} onPick={pickDate}
+        closedDays={c.closedDays || []} closedWeekdays={g.closedWeekdays || []}
+        onToggleClosed={toggleClosed} onToggleWeekday={toggleWeekday} />
+
+      {/* 履歴 */}
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-3">入力した記録</h3>
+        <div className="max-h-80 overflow-auto">
+          {c.dailySales.length === 0 && (
+            <div className="text-center py-8">
+              <div className="inline-block opacity-80"><Mascot type={s.settings.mascotType} size={72} mood="think" /></div>
+              <div className="text-sm text-stone-400 mt-2">まだ記録がないにゃ。<br />上の「今日の入力」から始めよ〜</div>
+            </div>
+          )}
+          {[...c.dailySales].reverse().map((row) => {
+            const rg = (row.gross != null ? row.gross : row.amount) || 0;
+            const rn = rg / (1 + (g.taxRate || 0));
+            const rs = row.customers ? rg / row.customers : 0;
+            return (
+              <div key={row.date} className="flex items-center gap-3 py-2 border-b border-stone-100 text-sm">
+                <span className="text-stone-400 w-24 shrink-0">{row.date}</span>
+                <div className="flex-1 flex flex-wrap gap-x-4 gap-y-0.5">
+                  <span className="tabnum font-bold text-stone-700">税込 {yen(rg)}</span>
+                  <span className="tabnum text-emerald-500">税別 {yen(rn)}</span>
+                  {row.customers ? <span className="tabnum text-stone-400">{row.customers}人 / 単価 {yen(rs)}</span> : null}
+                </div>
+                <button onClick={() => delLog(row.date)} className="text-rose-300 hover:text-rose-500 text-xs shrink-0">削除</button>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：お店の費用（スマホ縦画面むけ）
+   ============================================================ */
+const STAFF_ROLES = ['スタイリスト', 'アシスタント', 'アルバイト', 'レセプション', 'ネイリスト', 'アイリスト', '業務委託', 'その他'];
+
+function periodLabel(isSole, fiscalStart, year) {
+  if (isSole) return `${year}年 1月〜12月`;
+  const endM = fiscalStart === 1 ? 12 : fiscalStart - 1;
+  const endY = fiscalStart === 1 ? year : year + 1;
+  return `${year}年${fiscalStart}月 〜 ${endY}年${endM}月`;
+}
+
+function StaffCard({ p, info, isSole, fiscalStart, year, onChange, onDelete }) {
+  const partial = !!p.startMonth;
+  return (
+    <div className="border border-stone-100 rounded-2xl p-3 space-y-2.5 bg-white">
+      {/* 名前 ＋ 削除 */}
+      <div className="flex gap-2 items-center">
+        <input value={p.name} onChange={(e) => onChange({ name: e.target.value })} placeholder="名前"
+          className="border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base flex-1 min-w-0" />
+        <button onClick={onDelete} className="w-10 h-10 rounded-xl bg-stone-50 text-rose-300 hover:text-rose-500 text-lg shrink-0">✕</button>
+      </div>
+      {/* 職種 */}
+      <select value={p.role} onChange={(e) => onChange({ role: e.target.value })}
+        className="w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base">
+        {STAFF_ROLES.map((r) => <option key={r}>{r}</option>)}
+      </select>
+      {/* 月給 */}
+      <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden">
+        <span className="pl-3 text-sm text-stone-400 shrink-0">月給</span>
+        <span className="pl-2 text-stone-300">¥</span>
+        <input type="number" inputMode="numeric" value={p.monthlySalary} step={10000}
+          onChange={(e) => onChange({ monthlySalary: parseFloat(e.target.value) || 0 })}
+          className="w-full px-2 py-2.5 outline-none tabnum text-right text-lg font-bold bg-transparent" />
+        <span className="pr-3 text-xs text-stone-300 tabnum shrink-0">{man(p.monthlySalary)}</span>
+      </div>
+      {/* 勤務期間 */}
+      <div className="flex gap-1.5 items-center flex-wrap">
+        <span className="text-sm text-stone-400 shrink-0">今期の勤務</span>
+        <button onClick={() => onChange({ startMonth: null })}
+          className={'px-3 py-1.5 rounded-full text-sm font-bold ' + (!partial ? 'bg-rose-400 text-white' : 'bg-stone-100 text-stone-400')}>
+          通年（ずっと）
+        </button>
+        <button onClick={() => onChange({ startMonth: p.startMonth || (isSole ? 6 : fiscalStart) })}
+          className={'px-3 py-1.5 rounded-full text-sm font-bold ' + (partial ? 'bg-rose-400 text-white' : 'bg-stone-100 text-stone-400')}>
+          途中から
+        </button>
+        {partial && (
+          <select value={p.startMonth} onChange={(e) => onChange({ startMonth: parseInt(e.target.value, 10) })}
+            className="border-2 border-stone-100 bg-stone-50 rounded-xl px-2 py-1.5 text-sm">
+            {MONTH_NAMES.map((nm, i) => <option key={i} value={i + 1}>{nm}から</option>)}
+          </select>
+        )}
+      </div>
+      {/* 今期の人件費 */}
+      <div className="bg-peach rounded-xl px-3 py-2 flex justify-between items-center text-sm">
+        <span className="text-stone-500">今期 <b className="text-rose-400">{info.months}ヶ月</b>ぶん</span>
+        <b className="tabnum text-rose-400">{man(info.annual)}</b>
+      </div>
+    </div>
+  );
+}
+
+function CostTab({ s, setS, m }) {
+  const c = s.current;
+  const g = s.settings;
+  const up = (patch) => setS({ ...s, current: { ...c, ...patch } });
+  const upG = (patch) => setS({ ...s, settings: { ...g, ...patch } });
+  const setStaff = (staff) => up({ staff });
+  const addStaff = () => setStaff([...c.staff, { id: Date.now(), name: '', role: 'スタイリスト', monthlySalary: 220000, startMonth: null }]);
+  const updStaff = (id, patch) => setStaff(c.staff.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const delStaff = (id) => setStaff(c.staff.filter((p) => p.id !== id));
+  const infoOf = (id) => m.staffAnnual.find((x) => x.id === id) || { months: 12, annual: 0 };
+  const annualLaborWithIns = m.annualStaffSalary * (1 + c.socialInsuranceRate);
+
+  return (
+    <div className="space-y-4">
+      {/* スタッフ（人件費）— 主役なので先頭・全幅 */}
+      <Card className="p-5">
+        <div className="flex justify-between items-center mb-1">
+          <h3 className="font-bold text-stone-600 text-lg">はたらく人とお給料</h3>
+          <button onClick={addStaff} className="bg-emerald-400 hover:bg-emerald-500 text-white px-4 py-2 rounded-full text-sm font-bold shrink-0">＋ 追加</button>
+        </div>
+        <p className="text-xs text-stone-400 mb-3">
+          数える期間：<b className="text-stone-500">{periodLabel(m.isSole, m.fiscalStart, g.taxYear)}</b>
+          {m.isSole ? '（個人事業主は1〜12月）' : '（法人は決算期）'}
+        </p>
+        {!m.isSole && (
+          <label className="flex items-center gap-2 text-sm text-stone-500 mb-3 bg-stone-50 rounded-xl px-3 py-2">
+            期首（決算のはじまり）
+            <select value={g.fiscalStartMonth} onChange={(e) => upG({ fiscalStartMonth: parseInt(e.target.value, 10) })}
+              className="border-2 border-stone-100 bg-white rounded-xl px-2 py-1.5">
+              {MONTH_NAMES.map((nm, i) => <option key={i} value={i + 1}>{nm}</option>)}
+            </select>
+          </label>
+        )}
+        <div className="space-y-3">
+          {c.staff.map((p) => (
+            <StaffCard key={p.id} p={p} info={infoOf(p.id)} isSole={m.isSole} fiscalStart={m.fiscalStart} year={g.taxYear}
+              onChange={(patch) => updStaff(p.id, patch)} onDelete={() => delStaff(p.id)} />
+          ))}
+          {c.staff.length === 0 && <div className="text-center text-stone-300 py-6 text-sm">「＋追加」でスタッフを登録しましょう</div>}
+        </div>
+        {/* まとめ */}
+        <div className="mt-4 bg-stone-50 rounded-2xl p-4 space-y-1.5 text-sm">
+          <div className="flex justify-between"><span className="text-stone-400">毎月のお給料（今の人数）</span><b className="tabnum">{man(m.staffSalary)}</b></div>
+          <div className="flex justify-between"><span className="text-stone-400">毎月の人件費（保険込）</span><b className="tabnum text-rose-500">{man(m.laborCost)}</b></div>
+          <div className="flex justify-between"><span className="text-stone-400">売上にしめる割合</span><b className="tabnum">{pct(m.monthlySales ? m.laborCost / m.monthlySales : 0)}</b></div>
+          <div className="border-t border-stone-200 pt-1.5 flex justify-between">
+            <span className="text-stone-400">今期の人件費（保険込・申告用）</span><b className="tabnum text-rose-500">{man(annualLaborWithIns)}</b>
+          </div>
+        </div>
+      </Card>
+
+      {/* 毎月かかるお金 */}
+      <Card className="p-5 space-y-4">
+        <h3 className="font-bold text-stone-600 text-lg">毎月かかるお金</h3>
+        <RateAmountField label="材料費（売れた分にかかる）" rate={c.materialCostRate} onChange={(v) => up({ materialCostRate: v })}
+          amount={m.monthlySales * c.materialCostRate} step={0.5} hint="薬剤・カラー材などを売上に対してざっくり％で。例：6%" />
+        <Field label="家賃" value={c.rent} onChange={(v) => up({ rent: v })} />
+        <Field label="水道・電気・ガス" value={c.utilities} onChange={(v) => up({ utilities: v })} />
+        <Field label="その他（通信・広告・消耗品など）" value={c.otherFixed} onChange={(v) => up({ otherFixed: v })} hint="材料費はここに含めず、上の％で別管理します" />
+        {m.isSole
+          ? <div className="bg-peach rounded-xl p-3 text-sm text-stone-500">ご自身の取り分は、ここではなく<b className="text-rose-400">「暮らしのお金」</b>で管理します。</div>
+          : <Field label="自分の役員報酬" value={c.ownerSalary} onChange={(v) => up({ ownerSalary: v })} hint="法人では経費になります" />}
+        <PercentField label="社会保険の会社負担" value={c.socialInsuranceRate} onChange={(v) => up({ socialInsuranceRate: v })} step={1} hint="お給料に上乗せ（目安15%）" />
+        <Field label="今ある お金（現金・預金）" value={c.cashOnHand} onChange={(v) => up({ cashOnHand: v })} step={10000} hint="お店をふやす元手になります" />
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：出店計画（逆算）
+   ============================================================ */
+function ExpansionTab({ s, setS, m }) {
+  const e = s.expansion;
+  const up = (patch) => setS({ ...s, expansion: { ...e, ...patch } });
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-1">出店の規模を入力</h3>
+        <p className="text-sm text-stone-400 mb-4">規模を決めると、初期費用・運転資金・必要な自己資金・積立計画まで逆算します。</p>
+        <div className="grid md:grid-cols-3 gap-x-6 gap-y-4">
+          <Slider label="出店までの年数" value={e.yearsUntil} onChange={(v) => up({ yearsUntil: v })} min={1} max={10} step={1} fmt={(v) => v + '年後'} />
+          <Slider label="店舗の広さ" value={e.tsubo} onChange={(v) => up({ tsubo: v })} min={5} max={50} step={1} fmt={(v) => v + '坪'} />
+          <Slider label="セット面（席数）" value={e.seats} onChange={(v) => up({ seats: v })} min={1} max={20} step={1} fmt={(v) => v + '席'} />
+          <Field label="内装費（坪単価）" value={e.interiorCostPerTsubo} onChange={(v) => up({ interiorCostPerTsubo: v })} step={50000} hint="スケルトンから ¥50〜80万/坪が目安" />
+          <Field label="設備費" value={e.equipmentCost} onChange={(v) => up({ equipmentCost: v })} step={100000} hint="シャンプー台・椅子・什器" />
+          <Field label="新店の家賃" value={e.newRent} onChange={(v) => up({ newRent: v })} />
+          <Field label="敷金・礼金（家賃の月数）" value={e.depositMonths} onChange={(v) => up({ depositMonths: v })} unit="ヶ月" step={1} />
+          <Field label="採用費（1人あたり）" value={e.recruitCostPerStaff} onChange={(v) => up({ recruitCostPerStaff: v })} step={50000} />
+          <Field label="新規採用人数" value={e.newStaffCount} onChange={(v) => up({ newStaffCount: v })} unit="人" step={1} />
+          <Field label="開業諸経費・予備費" value={e.miscInitial} onChange={(v) => up({ miscInitial: v })} step={50000} />
+          <Field label="新店スタッフ平均月給" value={e.avgStaffSalary} onChange={(v) => up({ avgStaffSalary: v })} step={10000} />
+          <Field label="新店その他固定費" value={e.newOtherFixed} onChange={(v) => up({ newOtherFixed: v })} />
+          <Field label="新店 水道光熱費" value={e.newUtilities} onChange={(v) => up({ newUtilities: v })} />
+          <Slider label="運転資金（固定費の月数）" value={e.workingCapitalMonths} onChange={(v) => up({ workingCapitalMonths: v })} min={3} max={12} step={1} fmt={(v) => v + 'ヶ月分'} />
+          <Slider label="自己資金の目標比率" value={e.selfFundsRatio} onChange={(v) => up({ selfFundsRatio: v })} min={0.1} max={1} step={0.05} fmt={(v) => pct(v)} />
+          <Field label="新店の想定月商" value={e.expectedMonthlySales} onChange={(v) => up({ expectedMonthlySales: v })} step={50000} />
+        </div>
+      </Card>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">必要資金の内訳</h3>
+          <div className="space-y-2 text-sm">
+            <Row label="内装工事費" v={m.interior} sub={e.tsubo + '坪 × ' + man(e.interiorCostPerTsubo)} />
+            <Row label="設備費" v={s.expansion.equipmentCost} />
+            <Row label="敷金・礼金" v={m.deposit} sub={'家賃' + e.depositMonths + 'ヶ月'} />
+            <Row label="採用費" v={m.recruit} sub={e.newStaffCount + '人'} />
+            <Row label="諸経費・予備費" v={s.expansion.miscInitial} />
+            <div className="border-t border-stone-100 pt-2 flex justify-between font-semibold">
+              <span>初期費用 小計</span><span className="tabnum">{man(m.initialCost)}</span>
+            </div>
+            <Row label="運転資金" v={m.workingCapital} sub={'固定費' + man(m.newRunningFixed) + ' × ' + e.workingCapitalMonths + 'ヶ月'} />
+            <div className="border-t-2 border-stone-200 pt-2 flex justify-between text-lg font-bold text-rose-400">
+              <span>総必要資金</span><span className="tabnum">{man(m.totalNeeded)}</span>
+            </div>
+          </div>
+        </Card>
+
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">資金調達の逆算</h3>
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <KPI label="自己資金 目標" value={man(m.selfFundsTarget)} tone="amber" />
+            <KPI label="借入 必要額" value={man(m.loanNeeded)} tone="blue" />
+          </div>
+          <SavingChart s={s} m={m} />
+          <div className="mt-3 text-sm space-y-1.5">
+            <div className="flex justify-between"><span className="text-stone-400">現在の現預金</span><b className="tabnum">{man(s.current.cashOnHand)}</b></div>
+            <div className="flex justify-between"><span className="text-stone-400">毎月の積立必要額</span><b className="tabnum">{man(m.requiredMonthlySaving)}</b></div>
+            <div className="flex justify-between"><span className="text-stone-400">現状の積立余力（利益−生活費）</span>
+              <b className={'tabnum ' + (m.monthlySavingCapacity >= m.requiredMonthlySaving ? 'text-emerald-600' : 'text-rose-600')}>{man(m.monthlySavingCapacity)}</b></div>
+          </div>
+          <div className={'mt-4 rounded-xl p-4 ' + (m.planFeasible ? 'bg-emerald-50' : 'bg-rose-50')}>
+            {m.planFeasible ? (
+              <div className="text-emerald-800 text-sm">
+                ✅ <b>{e.yearsUntil}年で達成可能。</b> 現状ペースなら<b className="tabnum"> {man(m.projectedSelfFunds)}</b>まで貯まり、目標<b className="tabnum"> {man(m.selfFundsTarget)}</b>に届きます。
+                {isFinite(m.monthsToTarget) && <>（最短<b> {m.monthsToTarget}ヶ月</b>で到達）</>}
+              </div>
+            ) : (
+              <div className="text-rose-800 text-sm">
+                ⚠️ <b>現状ペースでは{e.yearsUntil}年で不足。</b> 月あと<b className="tabnum"> {man(Math.max(0, m.requiredMonthlySaving - m.monthlySavingCapacity))}</b>の積立増（=利益改善）が必要です。
+                {m.monthlySavingCapacity <= 0 && <span className="block mt-1">現状は積立余力がマイナス。まず本業の利益改善が先決です。</span>}
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function Row({ label, v, sub }) {
+  return (
+    <div className="flex justify-between items-baseline">
+      <span className="text-stone-400">{label}{sub && <span className="text-xs text-stone-300 ml-1">{sub}</span>}</span>
+      <span className="tabnum">{man(v)}</span>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：借入シミュレーション
+   ============================================================ */
+function LoanTab({ s, setS, m }) {
+  const L = s.loan;
+  const up = (patch) => setS({ ...s, loan: { ...L, ...patch } });
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      <Card className="p-5 space-y-4">
+        <h3 className="font-bold text-stone-600">借入条件</h3>
+        <div className="flex gap-2 text-sm">
+          <button onClick={() => up({ useLoanNeeded: true })}
+            className={'flex-1 py-2 rounded-xl border ' + (L.useLoanNeeded ? 'bg-rose-400 text-white border-rose-400' : 'border-stone-200 text-stone-500')}>
+            出店計画の借入額を使う
+          </button>
+          <button onClick={() => up({ useLoanNeeded: false })}
+            className={'flex-1 py-2 rounded-xl border ' + (!L.useLoanNeeded ? 'bg-rose-400 text-white border-rose-400' : 'border-stone-200 text-stone-500')}>
+            金額を指定
+          </button>
+        </div>
+        {L.useLoanNeeded
+          ? <div className="bg-peach rounded-xl p-3 text-sm">出店計画の借入必要額：<b className="tabnum text-rose-400">{man(m.loanNeeded)}</b></div>
+          : <Field label="借入額" value={L.amount} onChange={(v) => up({ amount: v })} step={100000} />}
+        <PercentField label="年利" value={L.interestRate} onChange={(v) => up({ interestRate: v })} step={0.1} hint="日本政策金融公庫の目安 1〜3%" />
+        <Slider label="返済期間" value={L.termYears} onChange={(v) => up({ termYears: v })} min={1} max={15} step={1} fmt={(v) => v + '年'} />
+        <Slider label="借入可能額の倍率（対自己資金）" value={L.borrowMultiple} onChange={(v) => up({ borrowMultiple: v })} min={1} max={4} step={0.5} fmt={(v) => '×' + v} />
+      </Card>
+
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <KPI label="毎月の返済額" value={man(m.monthlyRepay)} sub={yen(m.monthlyRepay)} tone="rose" big />
+          <KPI label="総返済額" value={man(m.totalRepay)} sub={'利息 ' + man(m.totalInterest)} tone="amber" big />
+        </div>
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">借入可能額の目安</h3>
+          <div className="text-sm text-stone-500 mb-2">
+            現預金（自己資金）<b className="tabnum"> {man(s.current.cashOnHand)}</b> ×{L.borrowMultiple} ＝
+            <b className="tabnum text-rose-400"> {man(m.borrowableEstimate)}</b> まで
+          </div>
+          <div className={'rounded-xl p-3 text-sm ' + (m.borrowableEstimate >= m.loanNeeded ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800')}>
+            {m.borrowableEstimate >= m.loanNeeded
+              ? <>✅ 必要な借入額 {man(m.loanNeeded)} は調達可能圏内です。</>
+              : <>⚠️ 必要額 {man(m.loanNeeded)} に対し、自己資金がもう<b className="tabnum"> {man((m.loanNeeded / L.borrowMultiple) - s.current.cashOnHand)}</b>あると安心です。</>}
+          </div>
+        </Card>
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">返済後の新店収支</h3>
+          <div className="space-y-1.5 text-sm">
+            <div className="flex justify-between"><span className="text-stone-400">新店 想定営業利益/月</span><b className="tabnum">{man(m.newStoreOperatingProfit)}</b></div>
+            <div className="flex justify-between"><span className="text-stone-400">毎月の返済</span><b className="tabnum text-rose-600">−{man(m.monthlyRepay)}</b></div>
+            <div className="border-t border-stone-100 pt-1.5 flex justify-between font-bold">
+              <span>返済後の手残り/月</span>
+              <b className={'tabnum ' + (m.newStoreAfterRepay >= 0 ? 'text-emerald-600' : 'text-rose-600')}>{man(m.newStoreAfterRepay)}</b>
+            </div>
+          </div>
+          {m.newStoreAfterRepay < 0 &&
+            <div className="mt-3 bg-rose-50 text-rose-800 rounded-xl p-3 text-sm">
+              ⚠️ 想定月商では返済が利益を上回ります。月商を上げるか、規模・借入を見直しましょう。
+            </div>}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：生活費
+   ============================================================ */
+function LivingTab({ s, setS, m }) {
+  const up = (items) => setS({ ...s, living: { ...s.living, items } });
+  const items = s.living.items;
+  const add = () => up([...items, { id: Date.now(), label: '新しい費目', amount: 0 }]);
+  const upd = (id, patch) => up(items.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  const del = (id) => up(items.filter((x) => x.id !== id));
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      <Card className="p-5">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="font-bold text-stone-600">毎月の生活費</h3>
+          <button onClick={add} className="bg-emerald-400 text-white px-3 py-1.5 rounded-full text-sm font-bold">＋ 費目を追加</button>
+        </div>
+        <div className="space-y-2">
+          {items.map((x) => (
+            <div key={x.id} className="flex items-center gap-2">
+              <input value={x.label} onChange={(e) => upd(x.id, { label: e.target.value })}
+                className="border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2 text-sm flex-1" />
+              <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden">
+                <input type="number" value={x.amount} step={1000}
+                  onChange={(e) => upd(x.id, { amount: parseFloat(e.target.value) || 0 })}
+                  className="w-28 px-2 py-2 text-sm text-right tabnum bg-transparent outline-none" />
+                <span className="px-2 text-xs text-stone-400">円</span>
+              </div>
+              <button onClick={() => del(x.id)} className="text-rose-300 hover:text-rose-500 px-1">✕</button>
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 bg-blush rounded-2xl p-4 flex justify-between items-center">
+          <span className="font-bold text-stone-600">毎月の生活費 合計</span>
+          <span className="text-2xl font-extrabold text-rose-400 tabnum">{man(m.livingMonthly)}</span>
+        </div>
+      </Card>
+
+      <div className="space-y-4">
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">事業からの引き出しと残り</h3>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between"><span className="text-stone-400">事業の利益（月）</span><b className="tabnum">{man(m.operatingProfit)}</b></div>
+            {m.isSole && <div className="flex justify-between"><span className="text-stone-400">概算税金（月割）</span><b className="tabnum text-rose-500">−{man(m.taxMonthly)}</b></div>}
+            <div className="flex justify-between"><span className="text-stone-400">手取り（月）</span><b className="tabnum">{man(m.netMonthly)}</b></div>
+            <div className="flex justify-between"><span className="text-stone-400">生活費（月）</span><b className="tabnum text-rose-500">−{man(m.livingMonthly)}</b></div>
+            <div className="border-t-2 border-stone-100 pt-2 flex justify-between font-bold">
+              <span>毎月 貯められる額</span>
+              <b className={'tabnum text-lg ' + (m.monthlySavingCapacity >= 0 ? 'text-emerald-500' : 'text-rose-500')}>{man(m.monthlySavingCapacity)}</b>
+            </div>
+          </div>
+          {!m.isSole && <p className="text-xs text-stone-400 mt-3">※法人のため、生活費は役員報酬から支払う前提です。出店の積立余力は税引後利益で計算しています。</p>}
+        </Card>
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-2">家計と事業のバランス</h3>
+          <div className="space-y-2">
+            <BalanceBar label="生活費" v={m.livingMonthly} base={Math.max(m.netMonthly, m.livingMonthly, 1)} tone="bg-rose-300" />
+            <BalanceBar label="貯蓄（積立余力）" v={Math.max(0, m.monthlySavingCapacity)} base={Math.max(m.netMonthly, m.livingMonthly, 1)} tone="bg-emerald-400" />
+          </div>
+          <p className="text-xs text-stone-400 mt-3">手取りに対する生活費の割合：<b className="tabnum">{pct(m.netMonthly ? m.livingMonthly / m.netMonthly : 0)}</b></p>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function BalanceBar({ label, v, base, tone }) {
+  return (
+    <div className="flex items-center gap-3">
+      <div className="w-28 text-sm text-stone-500 shrink-0">{label}</div>
+      <div className="flex-1 bg-stone-100 rounded-full h-6 overflow-hidden">
+        <div className={'h-full ' + tone + ' flex items-center justify-end px-2'} style={{ width: clamp(v / base * 100, 3, 100) + '%' }}>
+          <span className="text-xs text-white font-bold tabnum whitespace-nowrap">{man(v)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：領収書・経費（カメラ対応）
+   ============================================================ */
+const EXPENSE_CATEGORIES = [
+  '仕入（材料費）', '消耗品費', '広告宣伝費', '旅費交通費', '通信費',
+  '接待交際費', '水道光熱費', '地代家賃', '修繕費', '新聞図書費',
+  '福利厚生費', '租税公課', '損害保険料', '雑費',
+];
+
+// 科目の自動推定（キーワード）
+const CATEGORY_KEYWORDS = [
+  ['仕入（材料費）', ['カラー', 'パーマ', '薬剤', 'ディーラー', '材料', 'シャンプー', 'トリートメント', 'ワックス', 'ビューティ', 'ミルボン', '資生堂', '卸']],
+  ['消耗品費', ['ホーマック', 'カインズ', 'ニトリ', '無印', 'ダイソー', '文具', 'タオル', 'ホイル', 'コットン', 'ドラッグ', 'マツモトキヨシ', 'ウエルシア']],
+  ['旅費交通費', ['ガソリン', 'エネオス', 'コスモ', '出光', 'タクシー', 'JR', '駐車', 'パーキング', 'ETC', '高速', '電車', 'バス']],
+  ['通信費', ['ドコモ', 'au', 'ソフトバンク', '楽天モバイル', 'NTT', 'インターネット', 'wifi', 'Wi-Fi']],
+  ['接待交際費', ['居酒屋', 'レストラン', 'カフェ', 'スターバックス', 'ドトール', '飲食', '寿司', '焼肉', 'お祝い', 'ギフト']],
+  ['水道光熱費', ['電力', '電気', 'ガス', '水道', '東京電力', '関西電力', '九州電力']],
+  ['広告宣伝費', ['ホットペッパー', 'インスタ', '広告', 'チラシ', '印刷', 'グーグル', 'Google広告', 'SNS']],
+  ['新聞図書費', ['書店', '本', '雑誌', 'Amazon', '新聞']],
+];
+function guessCategory(text) {
+  const t = (text || '').toLowerCase();
+  for (const [cat, kws] of CATEGORY_KEYWORDS) {
+    if (kws.some((k) => t.includes(k.toLowerCase()))) return cat;
+  }
+  return '消耗品費';
+}
+
+// OCRテキストから 金額・日付・店名・科目 を推定
+function parseReceiptText(text) {
+  const lines = text.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  const grabMax = (str) => {
+    let max = 0, mt; const re = /([0-9][0-9,]{1,})/g;
+    while ((mt = re.exec(str))) { const n = parseInt(mt[1].replace(/,/g, ''), 10); if (n > max && n < 9000000) max = n; }
+    return max;
+  };
+  // 金額：合計系の行を優先、なければ全体の最大値
+  let amount = 0;
+  const totalLine = lines.find((l) => /(合\s*計|総額|お会計|お買上|税込|計\b)/.test(l));
+  if (totalLine) amount = grabMax(totalLine);
+  if (!amount) { lines.forEach((l) => { const n = grabMax(l); if (n > amount) amount = n; }); }
+  // 日付
+  let date = '';
+  const dm = text.match(/(20\d{2})\s*[\/\-年\.]\s*(\d{1,2})\s*[\/\-月\.]\s*(\d{1,2})/);
+  if (dm) date = `${dm[1]}-${String(dm[2]).padStart(2, '0')}-${String(dm[3]).padStart(2, '0')}`;
+  // 店名：数字記号だけでない、ある程度の長さの先頭行
+  const vendor = (lines.find((l) => l.length >= 2 && l.length <= 24 && !/^[0-9¥\\,\.\-\/:：\s]+$/.test(l)) || '').slice(0, 24);
+  return { amount, date, vendor, category: guessCategory(text) };
+}
+
+/* ============================================================
+   ★ OCR（レシート自動読み取り）プロバイダ切替
+   ──────────────────────────────────────────────
+   使うサービスが決まったら、ここを変えるだけで差し替えできます。
+   ・provider を 'tesseract' | 'google' | 'azure' | 'off' から選ぶ
+   ・クラウドOCRを使うときは apiKey / endpoint を入れて、下の該当関数に実装
+   ============================================================ */
+const OCR_CONFIG = {
+  provider: 'tesseract',  // ← ここを差し替えるだけでOCRを変更できます（'off'で自動読み取り無効）
+  apiKey: '',             // Google/Azure等を使う場合に設定
+  endpoint: '',           // 同上（必要な場合）
+};
+const OCR_PROVIDERS = {
+  // 自動読み取りオフ（手入力のみ）
+  off: async () => { throw { code: 'off' }; },
+  // 端末内でOCR（無料・APIキー不要。日本語モデルは初回のみDL）
+  tesseract: async (blob, onProgress) => {
+    if (typeof Tesseract === 'undefined') throw { code: 'unavailable' };
+    const { data } = await Tesseract.recognize(blob, 'jpn+eng', {
+      logger: (mm) => { if (mm.status === 'recognizing text') onProgress && onProgress(mm.progress); },
+    });
+    return data.text || '';
+  },
+  // Google Cloud Vision を使う場合はここに実装（OCR_CONFIG.apiKey を使用）
+  google: async (blob, onProgress) => {
+    // TODO: fetch('https://vision.googleapis.com/v1/images:annotate?key='+OCR_CONFIG.apiKey, {...})
+    throw { code: 'notimpl' };
+  },
+  // Azure / その他のOCRを使う場合はここに実装
+  azure: async (blob, onProgress) => {
+    // TODO: OCR_CONFIG.endpoint / apiKey を使って実装
+    throw { code: 'notimpl' };
+  },
+};
+// 画像 → テキスト（設定中のプロバイダで実行）
+async function recognizeReceipt(blob, onProgress) {
+  const fn = OCR_PROVIDERS[OCR_CONFIG.provider] || OCR_PROVIDERS.off;
+  return fn(blob, onProgress);
+}
+
+function ReceiptThumb({ id, hasImage }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    let u;
+    if (hasImage) ReceiptStore.get(id).then((blob) => { if (blob) { u = URL.createObjectURL(blob); setUrl(u); } });
+    return () => u && URL.revokeObjectURL(u);
+  }, [id, hasImage]);
+  if (!hasImage) return <div className="w-14 h-14 rounded-xl bg-stone-100 flex items-center justify-center text-stone-300 text-xs shrink-0">なし</div>;
+  if (!url) return <div className="w-14 h-14 rounded-xl bg-stone-100 animate-pulse shrink-0" />;
+  return <a href={url} target="_blank" rel="noreferrer"><img src={url} className="w-14 h-14 rounded-xl object-cover shrink-0 border border-stone-200" /></a>;
+}
+
+function ReceiptTab({ s, setS, m }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [form, setForm] = useState({ date: today, vendor: '', amount: '', category: EXPENSE_CATEGORIES[0], memo: '' });
+  const [pending, setPending] = useState(null); // 撮影した画像のBlob（保存待ち）
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [ocr, setOcr] = useState({ status: 'idle', progress: 0 }); // idle|reading|done|filled|error|unavailable
+  const fileRef = useRef(null);
+
+  const runOCR = async (blob) => {
+    if (OCR_CONFIG.provider === 'off') { setOcr({ status: 'off', progress: 0 }); return; }
+    setOcr({ status: 'reading', progress: 0 });
+    try {
+      const text = await recognizeReceipt(blob, (p) => setOcr({ status: 'reading', progress: p }));
+      const parsed = parseReceiptText(text);
+      setForm((f) => ({
+        ...f,
+        amount: parsed.amount ? String(parsed.amount) : f.amount,
+        date: parsed.date || f.date,
+        vendor: parsed.vendor || f.vendor,
+        category: parsed.category || f.category,
+      }));
+      setOcr({ status: 'filled', progress: 1, got: parsed });
+    } catch (err) {
+      const code = err && err.code;
+      setOcr({ status: code === 'unavailable' ? 'unavailable' : code === 'off' ? 'off' : 'error', progress: 0 });
+    }
+  };
+
+  const onPick = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const blob = await compressImage(file);
+    setPending(blob);
+    setPreviewUrl((old) => { if (old) URL.revokeObjectURL(old); return URL.createObjectURL(blob); });
+    runOCR(blob); // 自動で読み取り → フォームに反映
+  };
+
+  const save = async () => {
+    const id = 'r' + Date.now();
+    if (pending) await ReceiptStore.put(id, pending);
+    const rcp = {
+      id, date: form.date, vendor: form.vendor,
+      amount: parseFloat(form.amount) || 0, category: form.category,
+      memo: form.memo, hasImage: !!pending,
+    };
+    setS({ ...s, receipts: [rcp, ...(s.receipts || [])] });
+    setForm({ date: today, vendor: '', amount: '', category: form.category, memo: '' });
+    setPending(null);
+    setPreviewUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
+    setOcr({ status: 'idle', progress: 0 });
+    if (fileRef.current) fileRef.current.value = '';
+  };
+
+  const del = async (rcp) => {
+    if (rcp.hasImage) await ReceiptStore.del(rcp.id);
+    setS({ ...s, receipts: s.receipts.filter((x) => x.id !== rcp.id) });
+  };
+
+  const receipts = s.receipts || [];
+
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      <Card className="p-5 space-y-3">
+        <h3 className="font-bold text-stone-600">レシートを撮るだけ 📸</h3>
+        {/* カメラ/写真 */}
+        <div className="flex gap-3 items-center">
+          <label className="flex-1">
+            <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPick} className="hidden" />
+            <div className="cursor-pointer rounded-2xl border-2 border-dashed border-rose-200 bg-peach hover:bg-blush transition-colors py-6 text-center">
+              <div className="text-3xl">📷</div>
+              <div className="text-sm font-bold text-rose-400 mt-1">カメラで撮る / 写真を選ぶ</div>
+              <div className="text-xs text-stone-400">撮ると自動で金額・日付・科目を読み取ります</div>
+            </div>
+          </label>
+          {previewUrl && <img src={previewUrl} className="w-20 h-20 rounded-xl object-cover border border-stone-200" />}
+        </div>
+
+        {/* OCRの状態 */}
+        {ocr.status === 'reading' && (
+          <div className="bg-sky-50 rounded-2xl p-3">
+            <div className="flex items-center gap-2 text-sm text-sky-700 font-bold mb-2">
+              <span className="inline-block w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
+              自動で読み取り中… {Math.round(ocr.progress * 100)}%
+            </div>
+            <div className="h-2 bg-sky-100 rounded-full overflow-hidden">
+              <div className="h-full bg-sky-400 transition-all" style={{ width: (ocr.progress * 100) + '%' }} />
+            </div>
+            <div className="text-xs text-sky-600 mt-1.5">はじめての読み取りは少し時間がかかります（文字データを準備中）</div>
+          </div>
+        )}
+        {ocr.status === 'filled' && (
+          <div className="bg-emerald-50 rounded-2xl p-3 text-sm text-emerald-700">
+            ✅ 読み取りました！金額や日付が違ってたら、下で直してね。
+            {ocr.got && !ocr.got.amount && <span className="block text-amber-600 mt-1">⚠️ 金額をうまく読めませんでした。手で入れてね。</span>}
+          </div>
+        )}
+        {ocr.status === 'error' && (
+          <div className="bg-amber-50 rounded-2xl p-3 text-sm text-amber-700">読み取りに失敗しました。下の欄に手で入力してね。</div>
+        )}
+        {ocr.status === 'unavailable' && (
+          <div className="bg-amber-50 rounded-2xl p-3 text-sm text-amber-700">いまはネットにつながっていないため自動読み取りは使えません。手入力でも登録できます。</div>
+        )}
+        {ocr.status === 'off' && (
+          <div className="bg-stone-100 rounded-2xl p-3 text-sm text-stone-500">自動読み取りはオフです。下の欄に手で入力して登録できます。</div>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">日付</span>
+            <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })}
+              className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm" />
+          </label>
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">金額</span>
+            <input type="number" value={form.amount} step={100} placeholder="0"
+              onChange={(e) => setForm({ ...form, amount: e.target.value })}
+              className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm text-right tabnum" />
+          </label>
+        </div>
+        <label className="block">
+          <span className="text-sm text-stone-500 font-medium">勘定科目</span>
+          <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}
+            className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm">
+            {EXPENSE_CATEGORIES.map((cat) => <option key={cat}>{cat}</option>)}
+          </select>
+        </label>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">支払先</span>
+            <input value={form.vendor} onChange={(e) => setForm({ ...form, vendor: e.target.value })}
+              className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm" />
+          </label>
+          <label className="block">
+            <span className="text-sm text-stone-500 font-medium">メモ</span>
+            <input value={form.memo} onChange={(e) => setForm({ ...form, memo: e.target.value })}
+              className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm" />
+          </label>
+        </div>
+        <button onClick={save} disabled={!form.amount}
+          className={'w-full py-3 rounded-2xl font-bold text-white transition-colors ' + (form.amount ? 'bg-rose-400 hover:bg-rose-500' : 'bg-stone-200 cursor-not-allowed')}>
+          この領収書を保存
+        </button>
+      </Card>
+
+      <Card className="p-5">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="font-bold text-stone-600">登録済みの領収書</h3>
+          <span className="text-sm text-stone-400">{receipts.length}件 / 計 <b className="tabnum text-rose-400">{man(m.receiptTotal)}</b></span>
+        </div>
+        <div className="max-h-[28rem] overflow-auto space-y-2">
+          {receipts.length === 0 && (
+            <div className="text-center py-10">
+              <div className="inline-block opacity-80"><Mascot type={s.settings.mascotType} size={72} mood="happy" /></div>
+              <div className="text-sm text-stone-400 mt-2">まだレシートがないにゃ。<br />カメラで撮ってためてこ〜</div>
+            </div>
+          )}
+          {receipts.map((rcp) => (
+            <div key={rcp.id} className="flex items-center gap-3 p-2 rounded-2xl border border-stone-100 hover:bg-stone-50">
+              <ReceiptThumb id={rcp.id} hasImage={rcp.hasImage} />
+              <div className="flex-1 min-w-0">
+                <div className="flex justify-between items-baseline">
+                  <span className="font-bold text-stone-700 truncate">{rcp.vendor || '（支払先なし）'}</span>
+                  <span className="tabnum font-bold text-rose-400 shrink-0 ml-2">{yen(rcp.amount)}</span>
+                </div>
+                <div className="text-xs text-stone-400 flex gap-2 mt-0.5">
+                  <span>{rcp.date}</span>
+                  <span className="bg-peach text-rose-400 rounded-full px-2 font-medium">{rcp.category}</span>
+                </div>
+                {rcp.memo && <div className="text-xs text-stone-400 truncate mt-0.5">{rcp.memo}</div>}
+              </div>
+              <button onClick={() => del(rcp)} className="text-rose-300 hover:text-rose-500 text-sm shrink-0">削除</button>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：月次まとめ
+   ============================================================ */
+function MonthlyTab({ s, m }) {
+  const rows = [...m.monthly].reverse();
+  const maxAbs = Math.max(1, ...m.monthly.map((r) => Math.max(r.sales, r.expense)));
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-1">月次まとめ</h3>
+        <p className="text-sm text-stone-400 mb-4">売上ログと領収書から、月ごとの売上・経費・利益を自動集計します。</p>
+        {rows.length === 0 ? (
+          <div className="text-center text-stone-300 py-10 text-sm">データがありません。「売上」で日次ログ、「領収書」で経費を登録すると、ここに月ごとにまとまります。</div>
+        ) : (
+          <div className="space-y-3">
+            {rows.map((r) => (
+              <div key={r.month} className="border border-stone-100 rounded-2xl p-4">
+                <div className="flex justify-between items-baseline mb-2">
+                  <span className="font-bold text-stone-700">{r.month.replace('-', '年') + '月'}</span>
+                  <span className={'font-extrabold tabnum ' + (r.profit >= 0 ? 'text-emerald-500' : 'text-rose-500')}>利益 {man(r.profit)}</span>
+                </div>
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="w-12 text-xs text-stone-400">売上</span>
+                    <div className="flex-1 bg-stone-100 rounded-full h-4 overflow-hidden">
+                      <div className="h-full bg-sky-400" style={{ width: (r.sales / maxAbs * 100) + '%' }} />
+                    </div>
+                    <span className="w-24 text-right tabnum text-sm">{man(r.sales)}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-12 text-xs text-stone-400">経費</span>
+                    <div className="flex-1 bg-stone-100 rounded-full h-4 overflow-hidden">
+                      <div className="h-full bg-rose-300" style={{ width: (r.expense / maxAbs * 100) + '%' }} />
+                    </div>
+                    <span className="w-24 text-right tabnum text-sm">{man(r.expense)}</span>
+                  </div>
+                </div>
+                <div className="text-xs text-stone-400 mt-2 flex flex-wrap gap-x-3">
+                  <span>営業 {r.days || 0}日</span>
+                  <span>客数 {r.customers || 0}人</span>
+                  {r.avgSpend ? <span>客単価(税込) {yen(r.avgSpend)}</span> : null}
+                  <span>領収書 {r.count}件</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：確定申告まとめ
+   ============================================================ */
+function TaxTab({ s, setS, m }) {
+  const g = s.settings;
+  const up = (patch) => setS({ ...s, settings: { ...g, ...patch } });
+
+  const exportCSV = () => {
+    const rows = [['区分', '科目', '金額']];
+    rows.push(['収入', '売上（事業収入）', Math.round(m.annualSales)]);
+    Object.entries(m.expenseByItem).forEach(([k, v]) => rows.push(['経費', k, Math.round(v)]));
+    rows.push(['計算', '経費合計', Math.round(m.totalExpense)]);
+    rows.push(['計算', '所得金額（青色控除前）', Math.round(m.grossProfit)]);
+    if (m.isSole) {
+      rows.push(['控除', '青色申告特別控除', g.blueDeduction]);
+      rows.push(['税', '所得税', Math.round(m.taxDetail.incomeTax)]);
+      rows.push(['税', '復興特別所得税', Math.round(m.taxDetail.reconstruction)]);
+      rows.push(['税', '住民税', Math.round(m.taxDetail.residentTax)]);
+      rows.push(['税', '個人事業税', Math.round(m.taxDetail.businessTax)]);
+    } else {
+      rows.push(['税', '法人税等（概算）', Math.round(m.taxAnnual)]);
+    }
+    rows.push(['税', '税金合計（概算）', Math.round(m.taxAnnual)]);
+    const csv = '﻿' + rows.map((r) => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `確定申告まとめ_${g.taxYear}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <div className="flex flex-wrap gap-3 items-center justify-between">
+          <h3 className="font-bold text-stone-600">事業形態・申告設定</h3>
+          <div className="flex gap-1.5 bg-stone-100 rounded-full p-1">
+            {['個人事業主', '法人'].map((t) => (
+              <button key={t} onClick={() => up({ businessType: t })}
+                className={'px-4 py-1.5 rounded-full text-sm font-bold transition-colors ' + (g.businessType === t ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-400')}>
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+        {m.isSole ? (
+          <div className="grid md:grid-cols-3 gap-x-6 gap-y-3 mt-4">
+            <label className="block">
+              <span className="text-sm text-stone-500 font-medium">青色申告特別控除</span>
+              <select value={g.blueDeduction} onChange={(e) => up({ blueDeduction: parseInt(e.target.value) })}
+                className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm">
+                <option value={650000}>65万円（e-Tax・複式）</option>
+                <option value={550000}>55万円（複式・紙）</option>
+                <option value={100000}>10万円（簡易）</option>
+                <option value={0}>白色（0円）</option>
+              </select>
+            </label>
+            <Field label="国保＋年金（年額）" value={g.socialInsurance} onChange={(v) => up({ socialInsurance: v })} step={10000} hint="社会保険料控除になります" />
+            <Field label="その他所得控除（年額）" value={g.otherDeductions} onChange={(v) => up({ otherDeductions: v })} step={10000} hint="生命保険料控除・扶養控除など" />
+          </div>
+        ) : (
+          <div className="grid md:grid-cols-3 gap-6 mt-4">
+            <PercentField label="法人実効税率" value={g.corpTaxRate} onChange={(v) => up({ corpTaxRate: v })} step={1} hint="中小法人の目安 25〜35%" />
+          </div>
+        )}
+      </Card>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">損益（年間・青色申告決算書ベース）</h3>
+          <div className="space-y-1.5 text-sm">
+            <div className="flex justify-between font-bold"><span>売上（事業収入）</span><span className="tabnum text-sky-500">{man(m.annualSales)}</span></div>
+            <div className="border-t border-stone-100 my-1" />
+            {Object.entries(m.expenseByItem).map(([k, v]) => (
+              <div key={k} className="flex justify-between"><span className="text-stone-400">{k}</span><span className="tabnum">{man(v)}</span></div>
+            ))}
+            <div className="border-t border-stone-100 pt-1.5 flex justify-between font-semibold"><span>経費合計</span><span className="tabnum text-rose-400">{man(m.totalExpense)}</span></div>
+            <div className="border-t-2 border-stone-200 pt-2 flex justify-between text-base font-bold">
+              <span>所得金額（控除前）</span><span className="tabnum text-emerald-600">{man(m.grossProfit)}</span>
+            </div>
+          </div>
+          <p className="text-xs text-stone-400 mt-3">※家賃・給与などの定期費用（月次×12）＋領収書を科目別に合算しています。重複登録にご注意ください。</p>
+        </Card>
+
+        <Card className="p-5">
+          <h3 className="font-bold text-stone-600 mb-3">税金の概算（年間）</h3>
+          {m.isSole ? (
+            <div className="space-y-1.5 text-sm">
+              <div className="flex justify-between"><span className="text-stone-400">所得金額（控除前）</span><span className="tabnum">{man(m.grossProfit)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">− 青色申告特別控除</span><span className="tabnum">{man(g.blueDeduction)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">− 基礎控除</span><span className="tabnum">48万円</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">− 社会保険料控除</span><span className="tabnum">{man(g.socialInsurance)}</span></div>
+              <div className="border-t border-stone-100 pt-1.5 flex justify-between font-semibold"><span>課税所得</span><span className="tabnum">{man(m.taxDetail.taxable)}</span></div>
+              <div className="border-t border-stone-100 my-1" />
+              <div className="flex justify-between"><span className="text-stone-400">所得税</span><span className="tabnum">{man(m.taxDetail.incomeTax)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">復興特別所得税</span><span className="tabnum">{man(m.taxDetail.reconstruction)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">住民税（概算）</span><span className="tabnum">{man(m.taxDetail.residentTax)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">個人事業税</span><span className="tabnum">{man(m.taxDetail.businessTax)}</span></div>
+            </div>
+          ) : (
+            <div className="space-y-1.5 text-sm">
+              <div className="flex justify-between"><span className="text-stone-400">税引前利益</span><span className="tabnum">{man(m.businessIncomeAnnual)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-400">実効税率</span><span className="tabnum">{pct(g.corpTaxRate)}</span></div>
+            </div>
+          )}
+          <div className="mt-3 bg-blush rounded-2xl p-4 flex justify-between items-center">
+            <span className="font-bold text-stone-600">税金合計（概算）</span>
+            <span className="text-2xl font-extrabold text-rose-400 tabnum">{man(m.taxAnnual)}</span>
+          </div>
+          <div className="mt-2 flex justify-between text-sm">
+            <span className="text-stone-400">手取り見込み（年）</span>
+            <b className="tabnum text-emerald-600">{man(m.grossProfit - m.taxAnnual)}</b>
+          </div>
+        </Card>
+      </div>
+
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="font-bold text-stone-600">提出用に書き出す</h3>
+            <p className="text-sm text-stone-400">CSV/印刷でe-Tax・freee・マネーフォワード・税理士へ。</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={exportCSV} className="bg-emerald-400 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">📄 CSVで書き出す</button>
+            <button onClick={() => window.print()} className="bg-stone-600 hover:bg-stone-700 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">🖨️ 印刷 / PDF</button>
+          </div>
+        </div>
+        <div className="mt-4 bg-amber-50 text-amber-800 rounded-2xl p-4 text-sm">
+          ⚠️ <b>e-Taxへの直接送信はできません。</b>マイナンバーカード認証が必要なためです。本画面は青色申告決算書づくりの「下ごしらえ（集計）」です。金額はすべて概算で、最終的な申告・納税額は税理士または国税庁の確定申告書等作成コーナーでご確認ください。
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   タブ：1年の目標
+   ============================================================ */
+const MONTH_NAMES = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'];
+
+function PlanTab({ s, setS, m }) {
+  const plan = s.plan;
+  const up = (patch) => setS({ ...s, plan: { ...plan, ...patch } });
+  const setMonth = (i, v) => {
+    const t = [...plan.monthlyTargets];
+    t[i] = v;
+    up({ monthlyTargets: t });
+  };
+  const [annualInput, setAnnualInput] = useState('');
+  const splitEven = () => {
+    const total = parseFloat(annualInput) || m.planAnnualTarget;
+    const per = Math.round(total / 12 / 10000) * 10000;
+    up({ monthlyTargets: Array(12).fill(per) });
+  };
+  const maxV = Math.max(1, ...m.planRows.map((r) => Math.max(r.target, r.actual)));
+
+  const forecastTone = m.planForecastVsTarget >= 1 ? 'green' : m.planForecastVsTarget >= 0.9 ? 'amber' : 'red';
+
+  return (
+    <div className="space-y-4">
+      {/* ひとことサマリー */}
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-bold text-stone-600 text-lg">{plan.year}年の目標</h3>
+          <div className="flex items-center gap-1 text-sm">
+            <button onClick={() => up({ year: plan.year - 1 })} className="w-8 h-8 rounded-full bg-stone-100 text-stone-500 font-bold">‹</button>
+            <span className="w-14 text-center font-bold text-stone-600">{plan.year}年</span>
+            <button onClick={() => up({ year: plan.year + 1 })} className="w-8 h-8 rounded-full bg-stone-100 text-stone-500 font-bold">›</button>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+          <KPI label="1年の目標（合計）" value={man(m.planAnnualTarget)} tone="violet" big />
+          <KPI label="今までの合計" value={man(m.planActualTotal)} sub={'達成 ' + pct(m.planAchievement)} tone="blue" big />
+          <KPI label="このままいくと…（着地予想）" value={m.monthsWithData ? man(m.planForecast) : '—'} sub={m.monthsWithData ? '目標の ' + pct(m.planForecastVsTarget) : 'データがたまると出ます'} tone={forecastTone} big />
+        </div>
+        {m.monthsWithData > 0 && (
+          <div className={'mt-4 rounded-2xl p-4 text-sm ' + (forecastTone === 'green' ? 'bg-emerald-50 text-emerald-800' : forecastTone === 'amber' ? 'bg-amber-50 text-amber-800' : 'bg-rose-50 text-rose-800')}>
+            {forecastTone === 'green'
+              ? <>🎉 いいペースです！このまま続けると <b>{man(m.planForecast)}</b> で、目標を超えられそう。</>
+              : forecastTone === 'amber'
+              ? <>あと少し。今のペースだと <b>{man(m.planForecast)}</b>。目標まで月あと <b>{man(Math.max(0, (m.planAnnualTarget - m.planForecast) / 12))}</b> 増やせると届きます。</>
+              : <>今のペースだと <b>{man(m.planForecast)}</b> で目標に届きません。1日の客数や単価を少し見直してみましょう。</>}
+          </div>
+        )}
+      </Card>
+
+      {/* 目標のかんたん設定 */}
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-2">目標をまとめて決める</h3>
+        <p className="text-sm text-stone-400 mb-3">1年の目標額を入れて「12ヶ月に分ける」を押すと、毎月へ均等に割り振ります。あとから月ごとに微調整できます。</p>
+        <div className="flex flex-wrap gap-2 items-center">
+          <div className="flex items-center rounded-2xl border-2 border-stone-100 bg-stone-50 overflow-hidden">
+            <span className="pl-3 text-stone-300 font-bold">¥</span>
+            <input type="number" value={annualInput} placeholder={String(m.planAnnualTarget)} step={100000}
+              onChange={(e) => setAnnualInput(e.target.value)}
+              className="w-40 px-2 py-2.5 outline-none tabnum text-right bg-transparent" />
+          </div>
+          <button onClick={splitEven} className="bg-rose-400 hover:bg-rose-500 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">12ヶ月に分ける</button>
+        </div>
+      </Card>
+
+      {/* 月ごとの目標と実績 */}
+      <Card className="p-5">
+        <h3 className="font-bold text-stone-600 mb-1">毎月の目標</h3>
+        <p className="text-sm text-stone-400 mb-4">青いバーが目標、ピンクが実際の売上（税込）。繁忙期は多め、ひまな月は少なめに調整すると、ムリのない目標になります。</p>
+        <div className="space-y-3">
+          {m.planRows.map((r, i) => {
+            const reached = r.target && r.actual >= r.target;
+            return (
+              <div key={i} className="flex items-center gap-3">
+                <span className="w-10 text-sm font-bold text-stone-500 shrink-0">{MONTH_NAMES[i]}</span>
+                <div className="flex-1 min-w-0">
+                  {/* 目標バー（背景）＋実績バー（前景） */}
+                  <div className="relative h-7 bg-stone-100 rounded-full overflow-hidden">
+                    <div className="absolute inset-y-0 left-0 bg-sky-100" style={{ width: (r.target / maxV * 100) + '%' }} />
+                    <div className={'absolute inset-y-0 left-0 ' + (reached ? 'bg-emerald-400' : 'bg-rose-300')} style={{ width: (r.actual / maxV * 100) + '%' }} />
+                    {r.actual > 0 && <span className="absolute inset-y-0 left-2 flex items-center text-xs font-bold text-white tabnum">{man(r.actual)}</span>}
+                  </div>
+                </div>
+                <div className="flex items-center rounded-xl border-2 border-stone-100 bg-stone-50 overflow-hidden shrink-0">
+                  <span className="pl-2 text-xs text-stone-300">目標</span>
+                  <input type="number" value={r.target} step={50000}
+                    onChange={(e) => setMonth(i, parseFloat(e.target.value) || 0)}
+                    className="w-24 px-2 py-1.5 outline-none tabnum text-right text-sm bg-transparent" />
+                </div>
+                <span className="w-12 text-right text-xs font-bold tabnum shrink-0">
+                  {r.target ? <span className={reached ? 'text-emerald-500' : 'text-stone-400'}>{Math.round(r.rate * 100)}%</span> : '—'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-4 flex items-center gap-2 text-xs text-stone-400">
+          <span className="inline-block w-3 h-3 rounded-full bg-sky-100" /> 目標
+          <span className="inline-block w-3 h-3 rounded-full bg-rose-300 ml-2" /> 実際の売上
+          <span className="inline-block w-3 h-3 rounded-full bg-emerald-400 ml-2" /> 目標達成
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   メインApp
+   ============================================================ */
+const TABS = [
+  { id: 'dash', label: 'ホーム', icon: '🏠' },
+  { id: 'sales', label: '毎日入力', icon: '✏️' },
+  { id: 'plan', label: '1年の目標', icon: '🎯' },
+  { id: 'monthly', label: '月のまとめ', icon: '📅' },
+  { id: 'cost', label: 'お店の費用', icon: '👥' },
+  { id: 'living', label: '暮らしのお金', icon: '🍰' },
+  { id: 'receipt', label: 'レシート', icon: '🧾' },
+  { id: 'tax', label: '税金・申告', icon: '📋' },
+  { id: 'expand', label: 'お店をふやす', icon: '🌱' },
+  { id: 'loan', label: '借入れ', icon: '🏦' },
+];
+
+/* ============================================================
+   ★ 招待コード（参入障壁・かんたんアクセス制限）
+   ──────────────────────────────────────────────
+   ・配る相手に code を伝える。enabled:false か code:'' でゲート無効
+   ・注意：クライアント側のため "知らない人を弾く" 程度の気休め。
+     本気で守るならホスティング側（Cloudflare Access 等）でロックする
+   ============================================================ */
+const ACCESS_CONFIG = {
+  enabled: true,
+  code: 'saloneko',   // ← 招待コード
+};
+
+/* ============================================================
+   招待コードゲート
+   ============================================================ */
+function Gate({ onPass }) {
+  const [code, setCode] = useState('');
+  const [err, setErr] = useState(false);
+  const submit = () => {
+    if (code.trim().toLowerCase() === ACCESS_CONFIG.code.toLowerCase()) {
+      try { localStorage.setItem('saloneko-access', 'ok'); } catch (e) {}
+      onPass();
+    } else { setErr(true); }
+  };
+  return (
+    <div className="min-h-screen bg-cream flex items-center justify-center p-6">
+      <Card className="p-8 max-w-sm w-full text-center">
+        <div className="inline-block"><Mascot type="cat" size={92} mood="think" /></div>
+        <h1 className="text-2xl font-extrabold text-stone-700 mt-3">サロねこ</h1>
+        <p className="text-sm text-stone-400 mt-2 mb-5">招待された方だけのテスト版だにゃ。<br />あいことば（招待コード）を入れてね</p>
+        <input value={code} onChange={(e) => { setCode(e.target.value); setErr(false); }}
+          onKeyDown={(e) => e.key === 'Enter' && submit()} placeholder="招待コード"
+          className={'w-full text-center text-lg tabnum border-2 rounded-2xl px-4 py-3 outline-none bg-stone-50 ' + (err ? 'border-rose-300' : 'border-stone-100 focus:border-rose-300')} />
+        {err && <div className="text-rose-500 text-sm mt-2">コードが違うみたい…もう一度にゃ</div>}
+        <button onClick={submit} className="mt-4 w-full py-3.5 rounded-2xl font-extrabold text-white bg-rose-400 hover:bg-rose-500 transition-colors">入る</button>
+        <p className="text-[11px] text-stone-400 mt-4 leading-relaxed">🔒 入力したお金の情報は<b>この端末の中だけ</b>に保存され、外部に送信・公開されません。</p>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================
+   グランドデザイン（コンセプト画面）
+   ============================================================ */
+function Intro({ mascotType, onStart }) {
+  const points = [
+    { icon: '✂️', title: 'レジ締めのあと、ひと息ついて', text: '入れるのは売上と客数だけ。むずかしい計算は、ぜんぶ相棒におまかせ' },
+    { icon: '⏱️', title: '“あなたの1時間”の価値を、そっと', text: '時間単価も客単価も、責めずにやさしく見えてくるよ' },
+    { icon: '🐾', title: 'ひとりじゃない、となりにいるよ', text: '値上げも出店も、あせらず一緒に。背中を押すのは、あなたが決めたときだけ' },
+  ];
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-blush via-peach to-cream">
+      <div className="max-w-xl mx-auto px-6 py-10 text-center">
+        <div className="inline-block bg-white/70 rounded-full p-2 shadow-soft"><Mascot type={mascotType} size={116} mood="cheer" /></div>
+        <h1 className="text-2xl font-extrabold text-stone-700 mt-5 leading-relaxed">数字は苦手なままで、<br />だいじょうぶ。</h1>
+        <div className="bg-white rounded-3xl shadow-soft px-5 py-5 mt-5 text-sm text-stone-600 text-left leading-relaxed">
+          毎日お客様に向き合うあなたの<b className="text-rose-400">手仕事</b>は、AIの時代だからこそ、これからもっと特別な価値になります。<br /><br />
+          でも、カットもカラーも予約も経理もひとりでこなしていると、自分の数字とゆっくり向き合う時間なんて、なかなか取れないですよね。「むずかしそう」「見るのがちょっと怖い」——それで大丈夫です。<br /><br />
+          <b className="text-rose-400">サロねこ</b>は、会計ソフトでも、あなたを急かすアプリでもありません。レジ締めのあと、売上と客数をそっと入れるだけ。あとは相棒が「1時間あたりの価値」や「お店に残るお金」を、やさしい言葉でとなりから教えてくれます。<br /><br />
+          いつか自分の手仕事の<b className="text-rose-400">価値</b>に、ちゃんと自信を持てるように。今日からほんの少しずつ、<b className="text-rose-400">一緒に</b>。
+        </div>
+        <div className="grid gap-2.5 mt-5">
+          {points.map((p, i) => (
+            <div key={i} className="bg-white rounded-2xl shadow-soft px-4 py-3 flex items-center gap-3 text-left">
+              <span className="text-2xl shrink-0">{p.icon}</span>
+              <div>
+                <div className="font-bold text-stone-700 text-sm">{p.title}</div>
+                <div className="text-xs text-stone-400">{p.text}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        <button onClick={onStart} className="mt-7 w-full py-4 rounded-2xl font-extrabold text-white text-lg bg-rose-400 hover:bg-rose-500 active:scale-[0.99] transition-all shadow-soft">
+          はじめる ✨
+        </button>
+        <p className="text-xs text-stone-400 mt-3">※このお話は、メニューの「サロねこって？」からいつでも読み返せます</p>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   プライバシー・データの取り扱い（情報漏洩の不安への説明）
+   ============================================================ */
+function Privacy({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-3xl shadow-soft max-w-lg w-full max-h-[85vh] overflow-auto p-6" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-2xl">🔒</span>
+          <h2 className="text-lg font-extrabold text-stone-700">プライバシーとデータの取り扱い</h2>
+        </div>
+        <div className="bg-emerald-50 text-emerald-800 rounded-2xl p-4 text-sm font-bold mb-4">
+          あなたが入れたお金の情報は、<u>この端末（ブラウザ）の中だけ</u>に保存されます。外部に送ったり、公開したりしません。
+        </div>
+        <ul className="text-sm text-stone-600 space-y-2.5 leading-relaxed list-disc pl-5">
+          <li>売上・経費・スタッフ・生活費などの入力は、<b>あなたの端末内にのみ保存</b>。サーバーには送られず、<b>開発者も見られません</b>。</li>
+          <li>レシートの写真も、<b>端末の中だけ</b>に保存されます（外部に出ません）。</li>
+          <li>レシートの自動読み取り（文字認識）は、初回だけ「文字データ」をネットから取得します。<b>写真そのものは送らず、端末内で処理</b>します。</li>
+          <li>外部に通信するのは、画面の見た目（文字フォントなど）の読み込みだけで、<b>あなたの数字は一切含まれません</b>。</li>
+          <li><b>ご注意：</b>ブラウザのデータを消すと保存内容も消えます。別の端末では引き継がれません（今は端末内保存のため）。大切な数字はときどき控えを。</li>
+          <li>将来、複数店舗やスタッフ共有などでクラウド保存に対応する際は、<b>あらためて同意を確認</b>します。</li>
+          <li>このテスト版は招待者限定です。画面や内容を、許可なく外部に公開・共有しないでください。</li>
+          <li>数値は目安の計算です。実際の税務・融資は専門家にご相談ください。</li>
+        </ul>
+        <button onClick={onClose} className="mt-5 w-full py-3 rounded-2xl font-bold text-white bg-rose-400 hover:bg-rose-500">とじる</button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [s, setS] = useState(() => {
+    try {
+      const saved = localStorage.getItem('salon-finance-v1');
+      if (saved) return { ...DEFAULT_STATE, ...JSON.parse(saved) };
+    } catch (e) {}
+    return DEFAULT_STATE;
+  });
+  const [gateOk, setGateOk] = useState(() => {
+    if (!ACCESS_CONFIG.enabled || !ACCESS_CONFIG.code) return true;
+    try { return localStorage.getItem('saloneko-access') === 'ok'; } catch (e) { return false; }
+  });
+  const [onboarded, setOnboarded] = useState(() => {
+    try { return localStorage.getItem('saloneko-onboarded') === '1'; } catch (e) { return false; }
+  });
+  const [showIntro, setShowIntro] = useState(false);
+  const [showPrivacy, setShowPrivacy] = useState(false);
+  const startApp = () => {
+    try { localStorage.setItem('saloneko-onboarded', '1'); } catch (e) {}
+    setOnboarded(true); setShowIntro(false);
+  };
+  const [tab, setTab] = useState('dash');
+  const [visited, setVisited] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('saloneko-visited') || '[]')); } catch (e) { return new Set(); }
+  });
+  const goTab = (id) => {
+    setTab(id);
+    setVisited((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev); next.add(id);
+      try { localStorage.setItem('saloneko-visited', JSON.stringify([...next])); } catch (e) {}
+      return next;
+    });
+  };
+  const m = useMemo(() => compute(s), [s]);
+
+  useEffect(() => {
+    try { localStorage.setItem('salon-finance-v1', JSON.stringify(s)); } catch (e) {}
+  }, [s]);
+
+  const reset = () => { if (confirm('入力をすべて初期値に戻します。よろしいですか？')) setS(DEFAULT_STATE); };
+
+  if (!gateOk) return <Gate onPass={() => setGateOk(true)} />;
+  if (!onboarded || showIntro) return <Intro mascotType={s.settings.mascotType} onStart={startApp} />;
+
+  return (
+    <div className="min-h-screen pb-12">
+      <header className="bg-gradient-to-br from-rose-300 via-rose-200 to-amber-200 text-stone-700">
+        <div className="max-w-5xl mx-auto px-4 pt-6 pb-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-2xl bg-white/80 shadow-soft flex items-center justify-center p-1"><Mascot type={s.settings.mascotType} size={40} mood="happy" /></div>
+            <div>
+              <h1 className="text-xl font-extrabold">サロねこ</h1>
+              <p className="text-stone-500 text-sm">お店のお金、いっしょに見るにゃ</p>
+            </div>
+          </div>
+          <button onClick={reset} className="text-xs bg-white/60 hover:bg-white/90 text-stone-500 px-3 py-2 rounded-full transition-colors shadow-soft">初期値に戻す</button>
+        </div>
+        <div className="max-w-5xl mx-auto px-4 pb-4">
+          <div className="flex gap-1.5 overflow-x-auto pb-1">
+            {TABS.map((t) => (
+              <button key={t.id} onClick={() => goTab(t.id)}
+                className={'px-4 py-2.5 text-sm font-bold rounded-full whitespace-nowrap transition-all ' +
+                  (tab === t.id ? 'bg-white text-rose-400 shadow-soft scale-105' : 'text-stone-500 hover:bg-white/40')}>
+                <span className="mr-1">{t.icon}</span>{t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      <main key={tab} className="max-w-5xl mx-auto px-4 pt-5 fadein">
+        <TabHint type={s.settings.mascotType} tab={tab} />
+        {tab === 'dash' && <Dashboard s={s} setS={setS} m={m} visited={visited} goTab={goTab} />}
+        {tab === 'sales' && <SalesTab s={s} setS={setS} m={m} />}
+        {tab === 'plan' && <PlanTab s={s} setS={setS} m={m} />}
+        {tab === 'cost' && <CostTab s={s} setS={setS} m={m} />}
+        {tab === 'living' && <LivingTab s={s} setS={setS} m={m} />}
+        {tab === 'receipt' && <ReceiptTab s={s} setS={setS} m={m} />}
+        {tab === 'monthly' && <MonthlyTab s={s} m={m} />}
+        {tab === 'tax' && <TaxTab s={s} setS={setS} m={m} />}
+        {tab === 'expand' && <ExpansionTab s={s} setS={setS} m={m} />}
+        {tab === 'loan' && <LoanTab s={s} setS={setS} m={m} />}
+      </main>
+
+      <footer className="max-w-5xl mx-auto px-4 mt-8 text-center text-xs text-stone-300 space-y-2">
+        <div className="flex items-center justify-center gap-4">
+          <button onClick={() => setShowIntro(true)} className="text-rose-300 hover:text-rose-400 font-bold">🐾 サロねこって？</button>
+          <button onClick={() => setShowPrivacy(true)} className="text-rose-300 hover:text-rose-400 font-bold">🔒 プライバシー・データの扱い</button>
+        </div>
+        <div>入力内容はこの端末（ブラウザ）内だけに保存され、外部に送信・公開されません。数値は目安計算であり、実際の融資・税務は専門家にご相談ください。</div>
+      </footer>
+      {showPrivacy && <Privacy onClose={() => setShowPrivacy(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
