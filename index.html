@@ -29,12 +29,21 @@
   .tabnum { font-variant-numeric: tabular-nums; }
   ::-webkit-scrollbar { height: 8px; width: 8px; }
   ::-webkit-scrollbar-thumb { background: #e7d8cf; border-radius: 99px; }
-  input[type=range] { height: 6px; border-radius: 99px; }
-  input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%;
-    background: #fff; border: 3px solid #fb7185; box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer; margin-top: -1px;
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 20px;
+    background: transparent; cursor: pointer; margin: 0; padding: 0;
   }
   input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 99px; background: #ffe0d6; }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; border: 3px solid #fb7185; box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    margin-top: -7px; /* (track 6px - thumb 20px) / 2 = -7px で中央 */
+  }
+  input[type=range]::-moz-range-track { height: 6px; border-radius: 99px; background: #ffe0d6; }
+  input[type=range]::-moz-range-thumb {
+    width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 3px solid #fb7185;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
+  }
   .fadein { animation: fadein .35s ease; }
   @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 </style>
@@ -612,33 +621,39 @@ async function saveCSV(filename, csv) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// 印刷／PDF（iOS Safari対応：window.print()が効かない端末向けにiframeで印刷）
+// 印刷／PDF（iOS Safari対応：新しい画面を開き、その中の印刷ボタンから出力）
+// ※ window.open はクリックの同期コンテキストで呼ぶこと（ポップアップブロック回避）
 function printDoc(title, bodyHtml) {
+  const win = window.open('', '_blank');
   const html = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>${title}</title>
 <style>
-  body{font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;color:#333;padding:24px;}
+  body{font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;color:#333;margin:0;padding:24px;-webkit-text-size-adjust:100%;}
   h1{font-size:18px;margin:0 0 4px;} .sub{color:#888;font-size:12px;margin-bottom:16px;}
   table{width:100%;border-collapse:collapse;margin-bottom:16px;}
-  th,td{border-bottom:1px solid #ddd;padding:7px 6px;font-size:13px;text-align:left;}
+  th,td{border-bottom:1px solid #ddd;padding:8px 6px;font-size:13px;text-align:left;}
   td.num{text-align:right;font-variant-numeric:tabular-nums;}
   tr.head td{background:#f5f5f5;font-weight:bold;}
   tr.total td{border-top:2px solid #999;font-weight:bold;}
   .note{color:#999;font-size:11px;margin-top:12px;line-height:1.5;}
-</style></head><body>${bodyHtml}</body></html>`;
-  const iframe = document.createElement('iframe');
-  iframe.style.position = 'fixed'; iframe.style.right = '0'; iframe.style.bottom = '0';
-  iframe.style.width = '0'; iframe.style.height = '0'; iframe.style.border = '0';
-  document.body.appendChild(iframe);
-  const doc = iframe.contentWindow.document;
-  doc.open(); doc.write(html); doc.close();
-  const go = () => {
-    try { iframe.contentWindow.focus(); iframe.contentWindow.print(); }
-    catch (e) { window.print(); }
-    setTimeout(() => document.body.removeChild(iframe), 1000);
-  };
-  if (iframe.contentWindow.document.readyState === 'complete') setTimeout(go, 300);
-  else iframe.onload = () => setTimeout(go, 300);
+  .bar{position:sticky;top:0;background:#fff;padding:10px 0 14px;display:flex;gap:8px;border-bottom:1px solid #eee;margin-bottom:16px;}
+  .bar button{flex:1;padding:12px;border:0;border-radius:12px;font-size:15px;font-weight:bold;color:#fff;}
+  .bar .p{background:#10b981;} .bar .c{background:#9ca3af;}
+  .hint{color:#888;font-size:12px;text-align:center;margin:-8px 0 16px;}
+  @media print { .bar,.hint{display:none;} body{padding:0;} }
+</style></head><body>
+  <div class="bar">
+    <button class="p" onclick="window.print()">🖨️ 印刷 / PDFで保存</button>
+    <button class="c" onclick="window.close()">閉じる</button>
+  </div>
+  <div class="hint">iPhoneは「印刷」を押したあと、プレビューを<b>ピンチで広げる→共有→ファイルに保存</b>でPDFになります。</div>
+  ${bodyHtml}
+</body></html>`;
+  if (!win) { alert('印刷用の画面を開けませんでした。ブラウザのポップアップ許可をご確認ください。'); return; }
+  win.document.open(); win.document.write(html); win.document.close();
+  // PC等では自動でプレビューを試みる（iOSは上のボタンから）
+  try { win.onload = () => { setTimeout(() => { try { win.focus(); win.print(); } catch (e) {} }, 400); }; } catch (e) {}
 }
 
 // ％で設定 → その％の金額も表示するフィールド
@@ -663,7 +678,7 @@ function Slider({ label, value, onChange, min, max, step, fmt }) {
       </div>
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="w-full mt-2.5" />
+        className="block w-full" style={{ marginTop: '8px' }} />
     </label>
   );
 }
