@@ -2920,8 +2920,18 @@ function App() {
   const [visited, setVisited] = useState(() => {
     try { return new Set(JSON.parse(localStorage.getItem('saloneko-visited') || '[]')); } catch (e) { return new Set(); }
   });
+  // タブの横スクロール促し（一度動かす／タブを押すと消える）
+  const [showTabHint, setShowTabHint] = useState(() => {
+    try { return localStorage.getItem('saloneko-tabhint') !== '1'; } catch (e) { return true; }
+  });
+  const dismissTabHint = () => {
+    setShowTabHint(false);
+    try { localStorage.setItem('saloneko-tabhint', '1'); } catch (e) {}
+  };
   const goTab = (id) => {
     setTab(id);
+    dismissTabHint();
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' });
     setVisited((prev) => {
       if (prev.has(id)) return prev;
       const next = new Set(prev); next.add(id);
@@ -2965,17 +2975,37 @@ function App() {
           <button onClick={reset} className="text-xs bg-white/60 hover:bg-white/90 text-stone-500 px-3 py-2 rounded-full transition-colors shadow-soft">初期値に戻す</button>
         </div>
         <div className="max-w-5xl mx-auto px-4 pb-4">
-          <div className="flex gap-1.5 overflow-x-auto pb-1">
-            {TABS.map((t) => (
-              <button key={t.id} onClick={() => goTab(t.id)}
-                className={'px-4 py-2.5 text-sm font-bold rounded-full whitespace-nowrap transition-all ' +
-                  (tab === t.id ? 'bg-white text-rose-400 shadow-soft scale-105' : 'text-stone-500 hover:bg-white/40')}>
-                <span className="mr-1">{t.icon}</span>{t.label}
-              </button>
-            ))}
+          <div className="relative">
+            <div className="flex gap-1.5 overflow-x-auto pb-1 no-scrollbar"
+              onScroll={() => { if (showTabHint) dismissTabHint(); }}>
+              {TABS.map((t) => (
+                <button key={t.id} onClick={() => goTab(t.id)}
+                  className={'px-4 py-2.5 text-sm font-bold rounded-full whitespace-nowrap transition-all ' +
+                    (tab === t.id ? 'bg-white text-rose-400 shadow-soft scale-105' : 'text-stone-500 hover:bg-white/40')}>
+                  <span className="mr-1">{t.icon}</span>{t.label}
+                </button>
+              ))}
+            </div>
+            {showTabHint && (
+              <div className="pointer-events-none absolute top-0 right-0 h-full flex items-center">
+                <div className="h-full w-14 bg-gradient-to-l from-rose-200/90 to-transparent" />
+                <div className="absolute right-1 flex items-center gap-1 bg-white/95 text-rose-500 text-xs font-bold rounded-full px-2.5 py-1 shadow-soft nudge">
+                  よこにスライド<span className="text-sm leading-none">→</span>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </header>
+
+      {tab !== 'dash' && (
+        <div className="max-w-5xl mx-auto px-4 pt-4">
+          <button onClick={() => goTab('dash')}
+            className="inline-flex items-center gap-1.5 text-sm font-bold text-stone-500 bg-white hover:bg-peach border border-stone-200 rounded-full px-4 py-2 shadow-soft transition-colors">
+            <span className="text-base leading-none">←</span> ホーム（はじめの4ステップ）へもどる
+          </button>
+        </div>
+      )}
 
       <main key={tab} className="max-w-5xl mx-auto px-4 pt-5 fadein">
         <TabHint type={s.settings.mascotType} tab={tab} />
