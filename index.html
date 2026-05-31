@@ -492,6 +492,8 @@ const DEFAULT_STATE = {
     workingCapitalMonths: 6,       // 運転資金（固定費の月数）
     selfFundsRatio: 0.33,          // 自己資金比率の目標（総額の1/3）
     expectedMonthlySales: 1800000, // 新店の想定月商
+    rentArea: 'urban',             // 家賃の目安：エリア
+    rentFloor: 'upper',            // 家賃の目安：階数
   },
   loan: {
     useLoanNeeded: true, // 出店計画の借入必要額を使う
@@ -527,6 +529,34 @@ function KPI({ label, value, sub, tone = 'slate', big }) {
   );
 }
 
+// 数字入力（先頭ゼロを残さない／小数も可）。type=number の "02000000" 問題を回避
+function NumInput({ value, onChange, className = '', placeholder = '0' }) {
+  const [focused, setFocused] = useState(false);
+  const [text, setText] = useState('');
+  const norm = (raw) => {
+    let c = raw.replace(/[^0-9.]/g, '');
+    const parts = c.split('.');
+    if (parts.length > 2) c = parts[0] + '.' + parts.slice(1).join('');
+    c = c.replace(/^0+(?=\d)/, ''); // 先頭ゼロ除去（0.5 はそのまま）
+    return c;
+  };
+  const display = focused ? text : (value ? String(value) : '');
+  return (
+    <input
+      type="text" inputMode="decimal" value={display} placeholder={placeholder}
+      onFocus={() => { setFocused(true); setText(value ? String(value) : ''); }}
+      onBlur={() => setFocused(false)}
+      onChange={(e) => {
+        const c = norm(e.target.value);
+        setText(c);
+        const n = parseFloat(c);
+        onChange(isNaN(n) ? 0 : n);
+      }}
+      className={className}
+    />
+  );
+}
+
 function Field({ label, value, onChange, unit = '円', step = 1000, min = 0, hint }) {
   return (
     <label className="block">
@@ -535,11 +565,8 @@ function Field({ label, value, onChange, unit = '円', step = 1000, min = 0, hin
         {value > 0 && unit === '円' && <span className="text-xs text-rose-300 tabnum">{man(value)}</span>}
       </div>
       <div className="mt-1.5 flex items-center rounded-2xl border-2 border-stone-100 bg-stone-50 focus-within:border-rose-200 focus-within:bg-white transition-colors overflow-hidden">
-        <input
-          type="number" value={value} step={step} min={min}
-          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-          className="w-full px-3 py-2.5 outline-none tabnum text-right bg-transparent"
-        />
+        <NumInput value={value} onChange={onChange}
+          className="w-full px-3 py-2.5 outline-none tabnum text-right bg-transparent" />
         <span className="px-3 text-sm text-stone-400 self-stretch flex items-center">{unit}</span>
       </div>
       {hint && <div className="text-xs text-stone-400 mt-1">{hint}</div>}
@@ -1563,6 +1590,72 @@ function CostTab({ s, setS, m }) {
 /* ============================================================
    タブ：出店計画（逆算）
    ============================================================ */
+// 家賃のざっくり相場（坪あたり月額・あくまで目安）
+const RENT_AREAS = [
+  { id: 'prime',  label: '都心の一等地', sub: '表参道・銀座 級', unit: 32000 },
+  { id: 'urban',  label: '都市部・駅近', sub: '大都市の人気立地', unit: 20000 },
+  { id: 'local',  label: '地方都市の中心', sub: '繁華街・駅前',    unit: 12000 },
+  { id: 'suburb', label: '郊外・住宅街',   sub: 'ロードサイド等',  unit: 8000 },
+];
+const RENT_FLOORS = [
+  { id: 'ground', label: '1階・路面', factor: 1.0,  note: '人通り◎・家賃は高め' },
+  { id: 'upper',  label: '2階以上',   factor: 0.75, note: '路面の約7.5割' },
+  { id: 'base',   label: '地下',      factor: 0.7,  note: '路面の約7割' },
+];
+
+function RentEstimator({ e, up }) {
+  const area = RENT_AREAS.find((a) => a.id === e.rentArea) || RENT_AREAS[1];
+  const floor = RENT_FLOORS.find((f) => f.id === e.rentFloor) || RENT_FLOORS[1];
+  const estimate = Math.round((area.unit * e.tsubo * floor.factor) / 1000) * 1000;
+  const lo = Math.round(estimate * 0.8 / 10000) * 10000;
+  const hi = Math.round(estimate * 1.25 / 10000) * 10000;
+  return (
+    <Card className="p-5 bg-peach border-rose-100">
+      <h3 className="font-bold text-stone-600 mb-1">🏠 家賃の目安をさがす</h3>
+      <p className="text-sm text-stone-500 mb-3">エリアと階数をえらぶと、いまの「店舗の広さ（{e.tsubo}坪）」から家賃の目安を出します。</p>
+      <div className="space-y-3">
+        <div>
+          <div className="text-xs text-stone-400 mb-1.5 font-medium">エリア</div>
+          <div className="grid grid-cols-2 gap-2">
+            {RENT_AREAS.map((a) => (
+              <button key={a.id} type="button" onClick={() => up({ rentArea: a.id })}
+                className={'rounded-2xl p-2.5 text-left border-2 transition-all ' + (e.rentArea === a.id ? 'border-rose-300 bg-white' : 'border-transparent bg-white/60')}>
+                <div className="text-sm font-bold text-stone-600">{a.label}</div>
+                <div className="text-xs text-stone-400">{a.sub}・坪 {man(a.unit)}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="text-xs text-stone-400 mb-1.5 font-medium">階数</div>
+          <div className="grid grid-cols-3 gap-2">
+            {RENT_FLOORS.map((f) => (
+              <button key={f.id} type="button" onClick={() => up({ rentFloor: f.id })}
+                className={'rounded-2xl p-2.5 text-center border-2 transition-all ' + (e.rentFloor === f.id ? 'border-rose-300 bg-white' : 'border-transparent bg-white/60')}>
+                <div className="text-sm font-bold text-stone-600">{f.label}</div>
+                <div className="text-[10px] text-stone-400 mt-0.5 leading-tight">{f.note}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 bg-white rounded-2xl p-4">
+        <div className="text-xs text-stone-400">この条件だと（{area.label}・{floor.label}・{e.tsubo}坪）</div>
+        <div className="flex items-baseline gap-2 mt-1">
+          <span className="text-2xl font-extrabold text-rose-400 tabnum">{man(estimate)}</span>
+          <span className="text-sm text-stone-400">/ 月くらい</span>
+        </div>
+        <div className="text-xs text-stone-400 mt-1">だいたい {man(lo)}〜{man(hi)} の幅でみておくと安心</div>
+        <button type="button" onClick={() => up({ newRent: estimate })}
+          className="mt-3 w-full py-2.5 rounded-2xl font-bold text-sm bg-rose-400 hover:bg-rose-500 text-white transition-colors">
+          この金額を「新店の家賃」に入れる
+        </button>
+      </div>
+      <p className="text-xs text-stone-400 mt-3">※あくまでザックリ目安。実際の家賃は物件・路線・坪数で大きく変わります。気になる物件が見つかったら実額に直してね。</p>
+    </Card>
+  );
+}
+
 function ExpansionTab({ s, setS, m }) {
   const e = s.expansion;
   const up = (patch) => setS({ ...s, expansion: { ...e, ...patch } });
@@ -1577,7 +1670,7 @@ function ExpansionTab({ s, setS, m }) {
           <Slider label="セット面（席数）" value={e.seats} onChange={(v) => up({ seats: v })} min={1} max={20} step={1} fmt={(v) => v + '席'} />
           <Field label="内装費（坪単価）" value={e.interiorCostPerTsubo} onChange={(v) => up({ interiorCostPerTsubo: v })} step={50000} hint="スケルトンから ¥50〜80万/坪が目安" />
           <Field label="設備費" value={e.equipmentCost} onChange={(v) => up({ equipmentCost: v })} step={100000} hint="シャンプー台・椅子・什器" />
-          <Field label="新店の家賃" value={e.newRent} onChange={(v) => up({ newRent: v })} />
+          <Field label="新店の家賃" value={e.newRent} onChange={(v) => up({ newRent: v })} hint="↓下の「家賃の目安」から入れられます" />
           <Field label="敷金・礼金（家賃の月数）" value={e.depositMonths} onChange={(v) => up({ depositMonths: v })} unit="ヶ月" step={1} />
           <Field label="採用費（1人あたり）" value={e.recruitCostPerStaff} onChange={(v) => up({ recruitCostPerStaff: v })} step={50000} />
           <Field label="新規採用人数" value={e.newStaffCount} onChange={(v) => up({ newStaffCount: v })} unit="人" step={1} />
@@ -1590,6 +1683,8 @@ function ExpansionTab({ s, setS, m }) {
           <Field label="新店の想定月商" value={e.expectedMonthlySales} onChange={(v) => up({ expectedMonthlySales: v })} step={50000} />
         </div>
       </Card>
+
+      <RentEstimator e={e} up={up} />
 
       <div className="grid md:grid-cols-2 gap-4">
         <Card className="p-5">
@@ -1898,11 +1993,19 @@ function ReceiptThumb({ id, hasImage }) {
 
 function ReceiptTab({ s, setS, m }) {
   const today = new Date().toISOString().slice(0, 10);
-  const [form, setForm] = useState({ date: today, vendor: '', amount: '', category: EXPENSE_CATEGORIES[0], memo: '' });
+  const [form, setForm] = useState({ date: today, vendor: '', amount: '', category: EXPENSE_CATEGORIES[0], memo: '', docType: 'receipt' });
   const [pending, setPending] = useState(null); // 撮影した画像のBlob（保存待ち）
   const [previewUrl, setPreviewUrl] = useState(null);
   const [ocr, setOcr] = useState({ status: 'idle', progress: 0 }); // idle|reading|done|filled|error|unavailable
+  const [filter, setFilter] = useState('all'); // all|receipt|invoice
   const fileRef = useRef(null);
+
+  // よく使う支払先：過去の登録から頻度順に上位を出す
+  const frequentVendors = useMemo(() => {
+    const count = {};
+    (s.receipts || []).forEach((r) => { const v = (r.vendor || '').trim(); if (v) count[v] = (count[v] || 0) + 1; });
+    return Object.keys(count).sort((a, b) => count[b] - count[a]).slice(0, 8);
+  }, [s.receipts]);
 
   const runOCR = async (blob) => {
     if (OCR_CONFIG.provider === 'off') { setOcr({ status: 'off', progress: 0 }); return; }
@@ -1939,10 +2042,10 @@ function ReceiptTab({ s, setS, m }) {
     const rcp = {
       id, date: form.date, vendor: form.vendor,
       amount: parseFloat(form.amount) || 0, category: form.category,
-      memo: form.memo, hasImage: !!pending,
+      memo: form.memo, hasImage: !!pending, docType: form.docType || 'receipt',
     };
     setS({ ...s, receipts: [rcp, ...(s.receipts || [])] });
-    setForm({ date: today, vendor: '', amount: '', category: form.category, memo: '' });
+    setForm({ date: today, vendor: '', amount: '', category: form.category, memo: '', docType: form.docType });
     setPending(null);
     setPreviewUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
     setOcr({ status: 'idle', progress: 0 });
@@ -1954,12 +2057,22 @@ function ReceiptTab({ s, setS, m }) {
     setS({ ...s, receipts: s.receipts.filter((x) => x.id !== rcp.id) });
   };
 
-  const receipts = s.receipts || [];
+  const allReceipts = s.receipts || [];
+  const receipts = filter === 'all' ? allReceipts : allReceipts.filter((r) => (r.docType || 'receipt') === filter);
 
   return (
     <div className="grid md:grid-cols-2 gap-4">
       <Card className="p-5 space-y-3">
-        <h3 className="font-bold text-stone-600">レシートを撮るだけ 📸</h3>
+        <h3 className="font-bold text-stone-600">レシート・請求書を撮るだけ 📸</h3>
+        {/* 種類えらび：レシート / 請求書 */}
+        <div className="flex gap-2">
+          {[['receipt', '🧾 レシート'], ['invoice', '📄 請求書']].map(([k, lbl]) => (
+            <button key={k} type="button" onClick={() => setForm({ ...form, docType: k })}
+              className={'flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-colors ' + (form.docType === k ? 'bg-rose-400 text-white border-rose-400' : 'border-stone-200 text-stone-500 bg-white')}>
+              {lbl}
+            </button>
+          ))}
+        </div>
         {/* カメラ/写真 */}
         <div className="flex gap-3 items-center">
           <label className="flex-1">
@@ -2009,8 +2122,8 @@ function ReceiptTab({ s, setS, m }) {
           </label>
           <label className="block">
             <span className="text-sm text-stone-500 font-medium">金額</span>
-            <input type="number" value={form.amount} step={100} placeholder="0"
-              onChange={(e) => setForm({ ...form, amount: e.target.value })}
+            <NumInput value={form.amount ? parseFloat(form.amount) : 0}
+              onChange={(v) => setForm({ ...form, amount: v ? String(v) : '' })}
               className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm text-right tabnum" />
           </label>
         </div>
@@ -2024,7 +2137,7 @@ function ReceiptTab({ s, setS, m }) {
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
             <span className="text-sm text-stone-500 font-medium">支払先</span>
-            <input value={form.vendor} onChange={(e) => setForm({ ...form, vendor: e.target.value })}
+            <input value={form.vendor} onChange={(e) => setForm({ ...form, vendor: e.target.value })} placeholder="例：◯◯ディーラー"
               className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm" />
           </label>
           <label className="block">
@@ -2033,22 +2146,43 @@ function ReceiptTab({ s, setS, m }) {
               className="mt-1.5 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-sm" />
           </label>
         </div>
+        {frequentVendors.length > 0 && (
+          <div>
+            <div className="text-xs text-stone-400 mb-1.5">よく使う支払先（タップで入力）</div>
+            <div className="flex flex-wrap gap-1.5">
+              {frequentVendors.map((v) => (
+                <button key={v} type="button" onClick={() => setForm({ ...form, vendor: v })}
+                  className={'text-xs rounded-full px-3 py-1.5 border transition-colors ' + (form.vendor === v ? 'bg-rose-400 text-white border-rose-400' : 'bg-stone-50 text-stone-500 border-stone-200 hover:bg-peach')}>
+                  {v}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <button onClick={save} disabled={!form.amount}
           className={'w-full py-3 rounded-2xl font-bold text-white transition-colors ' + (form.amount ? 'bg-rose-400 hover:bg-rose-500' : 'bg-stone-200 cursor-not-allowed')}>
-          この領収書を保存
+          この{form.docType === 'invoice' ? '請求書' : 'レシート'}を保存
         </button>
       </Card>
 
       <Card className="p-5">
         <div className="flex justify-between items-center mb-3">
-          <h3 className="font-bold text-stone-600">登録済みの領収書</h3>
-          <span className="text-sm text-stone-400">{receipts.length}件 / 計 <b className="tabnum text-rose-400">{man(m.receiptTotal)}</b></span>
+          <h3 className="font-bold text-stone-600">ためた レシート・請求書</h3>
+          <span className="text-sm text-stone-400">{receipts.length}件 / 計 <b className="tabnum text-rose-400">{man(receipts.reduce((a, r) => a + (r.amount || 0), 0))}</b></span>
+        </div>
+        <div className="flex gap-1.5 mb-3">
+          {[['all', 'ぜんぶ'], ['receipt', '🧾 レシート'], ['invoice', '📄 請求書']].map(([k, lbl]) => (
+            <button key={k} type="button" onClick={() => setFilter(k)}
+              className={'text-xs rounded-full px-3 py-1.5 border transition-colors ' + (filter === k ? 'bg-stone-600 text-white border-stone-600' : 'bg-stone-50 text-stone-500 border-stone-200')}>
+              {lbl}
+            </button>
+          ))}
         </div>
         <div className="max-h-[28rem] overflow-auto space-y-2">
           {receipts.length === 0 && (
             <div className="text-center py-10">
               <div className="inline-block opacity-80"><Mascot type={s.settings.mascotType} size={72} mood="happy" /></div>
-              <div className="text-sm text-stone-400 mt-2">まだレシートがないにゃ。<br />カメラで撮ってためてこ〜</div>
+              <div className="text-sm text-stone-400 mt-2">まだ何もないにゃ。<br />レシートも請求書も、撮ってためてこ〜</div>
             </div>
           )}
           {receipts.map((rcp) => (
@@ -2059,7 +2193,10 @@ function ReceiptTab({ s, setS, m }) {
                   <span className="font-bold text-stone-700 truncate">{rcp.vendor || '（支払先なし）'}</span>
                   <span className="tabnum font-bold text-rose-400 shrink-0 ml-2">{yen(rcp.amount)}</span>
                 </div>
-                <div className="text-xs text-stone-400 flex gap-2 mt-0.5">
+                <div className="text-xs text-stone-400 flex gap-2 mt-0.5 flex-wrap">
+                  <span className={'rounded-full px-2 font-medium ' + ((rcp.docType || 'receipt') === 'invoice' ? 'bg-sky-50 text-sky-500' : 'bg-stone-100 text-stone-500')}>
+                    {(rcp.docType || 'receipt') === 'invoice' ? '請求書' : 'レシート'}
+                  </span>
                   <span>{rcp.date}</span>
                   <span className="bg-peach text-rose-400 rounded-full px-2 font-medium">{rcp.category}</span>
                 </div>
@@ -2320,8 +2457,8 @@ function PlanTab({ s, setS, m }) {
         <div className="flex flex-wrap gap-2 items-center">
           <div className="flex items-center rounded-2xl border-2 border-stone-100 bg-stone-50 overflow-hidden">
             <span className="pl-3 text-stone-300 font-bold">¥</span>
-            <input type="number" value={annualInput} placeholder={String(m.planAnnualTarget)} step={100000}
-              onChange={(e) => setAnnualInput(e.target.value)}
+            <NumInput value={annualInput} placeholder={String(m.planAnnualTarget)}
+              onChange={(v) => setAnnualInput(v ? String(v) : '')}
               className="w-40 px-2 py-2.5 outline-none tabnum text-right bg-transparent" />
           </div>
           <button onClick={splitEven} className="bg-rose-400 hover:bg-rose-500 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">12ヶ月に分ける</button>
@@ -2331,13 +2468,14 @@ function PlanTab({ s, setS, m }) {
       {/* 月ごとの目標と実績 */}
       <Card className="p-5">
         <h3 className="font-bold text-stone-600 mb-1">毎月の目標</h3>
-        <p className="text-sm text-stone-400 mb-4">青いバーが目標、ピンクが実際の売上（税込）。繁忙期は多め、ひまな月は少なめに調整すると、ムリのない目標になります。</p>
+        <p className="text-sm text-stone-400 mb-4">青いバーが目標、ピンクが実際の売上（税込）。繁忙期は <b>＋</b>、ひまな月は <b>−</b> で5万円ずつ調整できます（金額を直接いれてもOK）。</p>
         <div className="space-y-3">
           {m.planRows.map((r, i) => {
             const reached = r.target && r.actual >= r.target;
+            const stepMonth = (d) => setMonth(i, Math.max(0, (r.target || 0) + d));
             return (
-              <div key={i} className="flex items-center gap-3">
-                <span className="w-10 text-sm font-bold text-stone-500 shrink-0">{MONTH_NAMES[i]}</span>
+              <div key={i} className="flex items-center gap-2">
+                <span className="w-9 text-sm font-bold text-stone-500 shrink-0">{MONTH_NAMES[i]}</span>
                 <div className="flex-1 min-w-0">
                   {/* 目標バー（背景）＋実績バー（前景） */}
                   <div className="relative h-7 bg-stone-100 rounded-full overflow-hidden">
@@ -2346,13 +2484,15 @@ function PlanTab({ s, setS, m }) {
                     {r.actual > 0 && <span className="absolute inset-y-0 left-2 flex items-center text-xs font-bold text-white tabnum">{man(r.actual)}</span>}
                   </div>
                 </div>
-                <div className="flex items-center rounded-xl border-2 border-stone-100 bg-stone-50 overflow-hidden shrink-0">
-                  <span className="pl-2 text-xs text-stone-300">目標</span>
-                  <input type="number" value={r.target} step={50000}
-                    onChange={(e) => setMonth(i, parseFloat(e.target.value) || 0)}
-                    className="w-24 px-2 py-1.5 outline-none tabnum text-right text-sm bg-transparent" />
+                <div className="flex items-stretch rounded-xl border-2 border-stone-100 bg-stone-50 overflow-hidden shrink-0">
+                  <button type="button" onClick={() => stepMonth(-50000)}
+                    className="px-2.5 bg-stone-100 text-stone-400 text-lg font-bold active:bg-stone-200 leading-none">−</button>
+                  <NumInput value={r.target} onChange={(v) => setMonth(i, v)}
+                    className="w-20 px-1 py-1.5 outline-none tabnum text-right text-sm bg-transparent" />
+                  <button type="button" onClick={() => stepMonth(50000)}
+                    className="px-2.5 bg-stone-100 text-rose-300 text-lg font-bold active:bg-stone-200 leading-none">＋</button>
                 </div>
-                <span className="w-12 text-right text-xs font-bold tabnum shrink-0">
+                <span className="w-10 text-right text-xs font-bold tabnum shrink-0">
                   {r.target ? <span className={reached ? 'text-emerald-500' : 'text-stone-400'}>{Math.round(r.rate * 100)}%</span> : '—'}
                 </span>
               </div>
