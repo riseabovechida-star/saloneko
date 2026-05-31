@@ -51,8 +51,8 @@ const { useState, useEffect, useMemo, useRef } = React;
 const yen = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
 const man = (n) => {
   if (!isFinite(n)) return '—';
-  const m = (n || 0) / 10000;
-  if (Math.abs(m) >= 1000) return (m / 1000).toFixed(2) + '億円';
+  const m = (n || 0) / 10000;                       // 万円
+  if (Math.abs(m) >= 10000) return (m / 10000).toFixed(2) + '億円'; // 1億＝10,000万
   return (Math.round(m * 10) / 10).toLocaleString('ja-JP') + '万円';
 };
 const pct = (n) => (isFinite(n) ? (n * 100).toFixed(1) + '%' : '—');
@@ -581,6 +581,34 @@ function PercentField({ label, value, onChange, hint, step = 1 }) {
       value={Math.round((value || 0) * 1000) / 10}
       onChange={(v) => onChange((v || 0) / 100)} hint={hint} />
   );
+}
+
+// 万円入力用フィールド（内部は円で保持、画面では万円で入出力。ゼロが多くて嫌にならないように）
+function ManField({ label, value, onChange, hint }) {
+  return (
+    <Field label={label} unit="万円" hint={hint}
+      value={Math.round((value || 0) / 1000) / 10}
+      onChange={(v) => onChange(Math.round((v || 0) * 10000))} />
+  );
+}
+
+// CSV保存（iPhone対応：共有シート→「ファイルに保存」も可。ダメな端末はダウンロード）
+async function saveCSV(filename, csv) {
+  const blob = new Blob([csv], { type: 'text/csv' });
+  try {
+    if (navigator.canShare && typeof File !== 'undefined') {
+      const file = new File([blob], filename, { type: 'text/csv' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return;
+      }
+    }
+  } catch (e) { /* 共有不可ならダウンロードへ */ }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ％で設定 → その％の金額も表示するフィールド
@@ -1668,23 +1696,24 @@ function ExpansionTab({ s, setS, m }) {
           <Slider label="出店までの年数" value={e.yearsUntil} onChange={(v) => up({ yearsUntil: v })} min={1} max={10} step={1} fmt={(v) => v + '年後'} />
           <Slider label="店舗の広さ" value={e.tsubo} onChange={(v) => up({ tsubo: v })} min={5} max={50} step={1} fmt={(v) => v + '坪'} />
           <Slider label="セット面（席数）" value={e.seats} onChange={(v) => up({ seats: v })} min={1} max={20} step={1} fmt={(v) => v + '席'} />
-          <Field label="内装費（坪単価）" value={e.interiorCostPerTsubo} onChange={(v) => up({ interiorCostPerTsubo: v })} step={50000} hint="スケルトンから ¥50〜80万/坪が目安" />
-          <Field label="設備費" value={e.equipmentCost} onChange={(v) => up({ equipmentCost: v })} step={100000} hint="シャンプー台・椅子・什器" />
-          <Field label="新店の家賃" value={e.newRent} onChange={(v) => up({ newRent: v })} hint="↓下の「家賃の目安」から入れられます" />
+          <ManField label="内装費（坪単価）" value={e.interiorCostPerTsubo} onChange={(v) => up({ interiorCostPerTsubo: v })} hint="スケルトンから 50〜80万/坪が目安" />
+          <ManField label="設備費" value={e.equipmentCost} onChange={(v) => up({ equipmentCost: v })} hint="シャンプー台・椅子・什器" />
+          <ManField label="新店の家賃" value={e.newRent} onChange={(v) => up({ newRent: v })} hint="↓下の「家賃の目安」から入れられます" />
           <Field label="敷金・礼金（家賃の月数）" value={e.depositMonths} onChange={(v) => up({ depositMonths: v })} unit="ヶ月" step={1} />
-          <Field label="採用費（1人あたり）" value={e.recruitCostPerStaff} onChange={(v) => up({ recruitCostPerStaff: v })} step={50000} />
+          <ManField label="採用費（1人あたり）" value={e.recruitCostPerStaff} onChange={(v) => up({ recruitCostPerStaff: v })} />
           <Field label="新規採用人数" value={e.newStaffCount} onChange={(v) => up({ newStaffCount: v })} unit="人" step={1} />
-          <Field label="開業諸経費・予備費" value={e.miscInitial} onChange={(v) => up({ miscInitial: v })} step={50000} />
-          <Field label="新店スタッフ平均月給" value={e.avgStaffSalary} onChange={(v) => up({ avgStaffSalary: v })} step={10000} />
-          <Field label="新店その他固定費" value={e.newOtherFixed} onChange={(v) => up({ newOtherFixed: v })} />
-          <Field label="新店 水道光熱費" value={e.newUtilities} onChange={(v) => up({ newUtilities: v })} />
+          <ManField label="開業諸経費・予備費" value={e.miscInitial} onChange={(v) => up({ miscInitial: v })} />
+          <ManField label="新店スタッフ平均月給" value={e.avgStaffSalary} onChange={(v) => up({ avgStaffSalary: v })} />
+          <ManField label="新店その他固定費" value={e.newOtherFixed} onChange={(v) => up({ newOtherFixed: v })} />
+          <ManField label="新店 水道光熱費" value={e.newUtilities} onChange={(v) => up({ newUtilities: v })} />
           <Slider label="運転資金（固定費の月数）" value={e.workingCapitalMonths} onChange={(v) => up({ workingCapitalMonths: v })} min={3} max={12} step={1} fmt={(v) => v + 'ヶ月分'} />
           <Slider label="自己資金の目標比率" value={e.selfFundsRatio} onChange={(v) => up({ selfFundsRatio: v })} min={0.1} max={1} step={0.05} fmt={(v) => pct(v)} />
-          <Field label="新店の想定月商" value={e.expectedMonthlySales} onChange={(v) => up({ expectedMonthlySales: v })} step={50000} />
+          <ManField label="新店の想定月商" value={e.expectedMonthlySales} onChange={(v) => up({ expectedMonthlySales: v })} />
+        </div>
+        <div className="mt-4">
+          <RentEstimator e={e} up={up} />
         </div>
       </Card>
-
-      <RentEstimator e={e} up={up} />
 
       <div className="grid md:grid-cols-2 gap-4">
         <Card className="p-5">
@@ -2404,12 +2433,7 @@ function TaxTab({ s, setS, m }) {
     }
     rows.push(['（参考）税', '税金合計（概算）', Math.round(m.taxAnnual)]);
     const csv = '﻿' + rows.map((r) => r.join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `確定申告_転記用_${g.taxYear}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    saveCSV(`確定申告_転記用_${g.taxYear}.csv`, csv);
   };
 
   return (
@@ -2503,7 +2527,7 @@ function TaxTab({ s, setS, m }) {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="font-bold text-stone-600">控え・転記用に書き出す</h3>
-            <p className="text-sm text-stone-400">CSVは決算書の科目順。印刷/PDFは控えや税理士への共有に。</p>
+            <p className="text-sm text-stone-400">CSVは決算書の科目順。iPhoneは共有シートから「ファイルに保存」できます。</p>
           </div>
           <div className="flex gap-2">
             <button onClick={exportCSV} className="bg-emerald-400 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">📄 CSVで書き出す</button>
