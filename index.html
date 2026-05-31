@@ -621,10 +621,9 @@ async function saveCSV(filename, csv) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// 印刷／PDF（iOS Safari対応：新しい画面を開き、その中の印刷ボタンから出力）
+// 印刷／PDF（iOS Safari対応：HTMLをBlobにして新しいタブで開く＝document.write不要）
 // ※ window.open はクリックの同期コンテキストで呼ぶこと（ポップアップブロック回避）
 function printDoc(title, bodyHtml) {
-  const win = window.open('', '_blank');
   const html = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>${title}</title>
@@ -650,10 +649,14 @@ function printDoc(title, bodyHtml) {
   <div class="hint">iPhoneは「印刷」を押したあと、プレビューを<b>ピンチで広げる→共有→ファイルに保存</b>でPDFになります。</div>
   ${bodyHtml}
 </body></html>`;
-  if (!win) { alert('印刷用の画面を開けませんでした。ブラウザのポップアップ許可をご確認ください。'); return; }
-  win.document.open(); win.document.write(html); win.document.close();
-  // PC等では自動でプレビューを試みる（iOSは上のボタンから）
-  try { win.onload = () => { setTimeout(() => { try { win.focus(); win.print(); } catch (e) {} }, 400); }; } catch (e) {}
+  const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+  const win = window.open(url, '_blank');
+  if (!win) {
+    // ポップアップがブロックされた場合は同じタブで開く（戻るで復帰）
+    location.href = url;
+    return;
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 // ％で設定 → その％の金額も表示するフィールド
