@@ -593,22 +593,52 @@ function ManField({ label, value, onChange, hint }) {
 }
 
 // CSV保存（iPhone対応：共有シート→「ファイルに保存」も可。ダメな端末はダウンロード）
+// ※ title/text を付けると iOS で空のテキストが一緒に共有されるため、files のみ渡す
 async function saveCSV(filename, csv) {
   const blob = new Blob([csv], { type: 'text/csv' });
   try {
     if (navigator.canShare && typeof File !== 'undefined') {
       const file = new File([blob], filename, { type: 'text/csv' });
       if (navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: filename });
+        await navigator.share({ files: [file] });
         return;
       }
     }
-  } catch (e) { /* 共有不可ならダウンロードへ */ }
+  } catch (e) { /* 共有不可・キャンセルならダウンロードへ */ }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// 印刷／PDF（iOS Safari対応：window.print()が効かない端末向けにiframeで印刷）
+function printDoc(title, bodyHtml) {
+  const html = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<title>${title}</title>
+<style>
+  body{font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;color:#333;padding:24px;}
+  h1{font-size:18px;margin:0 0 4px;} .sub{color:#888;font-size:12px;margin-bottom:16px;}
+  table{width:100%;border-collapse:collapse;margin-bottom:16px;}
+  th,td{border-bottom:1px solid #ddd;padding:7px 6px;font-size:13px;text-align:left;}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  tr.head td{background:#f5f5f5;font-weight:bold;}
+  tr.total td{border-top:2px solid #999;font-weight:bold;}
+  .note{color:#999;font-size:11px;margin-top:12px;line-height:1.5;}
+</style></head><body>${bodyHtml}</body></html>`;
+  const iframe = document.createElement('iframe');
+  iframe.style.position = 'fixed'; iframe.style.right = '0'; iframe.style.bottom = '0';
+  iframe.style.width = '0'; iframe.style.height = '0'; iframe.style.border = '0';
+  document.body.appendChild(iframe);
+  const doc = iframe.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+  const go = () => {
+    try { iframe.contentWindow.focus(); iframe.contentWindow.print(); }
+    catch (e) { window.print(); }
+    setTimeout(() => document.body.removeChild(iframe), 1000);
+  };
+  if (iframe.contentWindow.document.readyState === 'complete') setTimeout(go, 300);
+  else iframe.onload = () => setTimeout(go, 300);
 }
 
 // ％で設定 → その％の金額も表示するフィールド
@@ -1684,6 +1714,33 @@ function RentEstimator({ e, up }) {
   );
 }
 
+// 規模プリセット：選ぶと「だいたいこのくらい」の目安が一式入る
+const SCALE_PRESETS = [
+  { id: 'solo', label: '1人サロン', sub: '自宅・6坪', vals: {
+    tsubo: 6, seats: 2, interiorCostPerTsubo: 500000, equipmentCost: 800000,
+    newRent: 80000, depositMonths: 6, recruitCostPerStaff: 100000, newStaffCount: 0,
+    miscInitial: 300000, avgStaffSalary: 250000, newOtherFixed: 30000, newUtilities: 20000,
+    expectedMonthlySales: 800000 } },
+  { id: 'small', label: '小型店', sub: '4席・12坪', vals: {
+    tsubo: 12, seats: 4, interiorCostPerTsubo: 600000, equipmentCost: 2500000,
+    newRent: 200000, depositMonths: 10, recruitCostPerStaff: 200000, newStaffCount: 1,
+    miscInitial: 500000, avgStaffSalary: 250000, newOtherFixed: 80000, newUtilities: 40000,
+    expectedMonthlySales: 1800000 } },
+  { id: 'mid', label: '中型店', sub: '8席・25坪', vals: {
+    tsubo: 25, seats: 8, interiorCostPerTsubo: 700000, equipmentCost: 5000000,
+    newRent: 450000, depositMonths: 10, recruitCostPerStaff: 250000, newStaffCount: 4,
+    miscInitial: 1000000, avgStaffSalary: 260000, newOtherFixed: 150000, newUtilities: 80000,
+    expectedMonthlySales: 4500000 } },
+];
+
+// プリセットからの初期費用ざっくり概算（内訳表と同じ式）
+function presetRoughCost(v) {
+  const interior = v.tsubo * v.interiorCostPerTsubo;
+  const deposit = v.newRent * v.depositMonths;
+  const recruit = v.recruitCostPerStaff * v.newStaffCount;
+  return interior + v.equipmentCost + deposit + recruit + v.miscInitial;
+}
+
 function ExpansionTab({ s, setS, m }) {
   const e = s.expansion;
   const up = (patch) => setS({ ...s, expansion: { ...e, ...patch } });
@@ -1691,6 +1748,17 @@ function ExpansionTab({ s, setS, m }) {
     <div className="space-y-4">
       <Card className="p-5">
         <h3 className="font-bold text-stone-600 mb-1">出店の規模を入力</h3>
+        <p className="text-sm text-stone-400 mb-3">まず近い規模をえらぶと、目安の金額が一式入ります。あとから自由に直せます。</p>
+        <div className="grid grid-cols-3 gap-2 mb-4">
+          {SCALE_PRESETS.map((p) => (
+            <button key={p.id} type="button" onClick={() => up(p.vals)}
+              className="rounded-2xl p-3 text-center border-2 border-stone-100 bg-stone-50 hover:border-rose-200 hover:bg-peach transition-all">
+              <div className="text-sm font-bold text-stone-600">{p.label}</div>
+              <div className="text-[10px] text-stone-400 mt-0.5">{p.sub}</div>
+              <div className="text-xs font-bold text-rose-400 mt-1 tabnum">初期 約{man(presetRoughCost(p.vals))}</div>
+            </button>
+          ))}
+        </div>
         <p className="text-sm text-stone-400 mb-4">規模を決めると、初期費用・運転資金・必要な自己資金・積立計画まで逆算します。</p>
         <div className="grid md:grid-cols-3 gap-x-6 gap-y-4">
           <Slider label="出店までの年数" value={e.yearsUntil} onChange={(v) => up({ yearsUntil: v })} min={1} max={10} step={1} fmt={(v) => v + '年後'} />
@@ -2436,6 +2504,32 @@ function TaxTab({ s, setS, m }) {
     saveCSV(`確定申告_転記用_${g.taxYear}.csv`, csv);
   };
 
+  const printSummary = () => {
+    const yenC = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+    let rows = '';
+    rows += `<tr class="head"><td>収入金額</td><td class="num"></td></tr>`;
+    rows += `<tr><td>売上（収入）金額</td><td class="num">${yenC(m.annualSales)}</td></tr>`;
+    if (transcript.cogs > 0) {
+      rows += `<tr class="head"><td>売上原価</td><td class="num"></td></tr>`;
+      rows += `<tr><td>仕入金額</td><td class="num">${yenC(transcript.cogs)}</td></tr>`;
+    }
+    rows += `<tr class="head"><td>経費（決算書の科目順）</td><td class="num"></td></tr>`;
+    transcript.lines.filter((l) => l.amount > 0).forEach((l) => {
+      rows += `<tr><td>${l.field}</td><td class="num">${yenC(l.amount)}</td></tr>`;
+    });
+    rows += `<tr class="total"><td>経費計</td><td class="num">${yenC(m.totalExpense - transcript.cogs)}</td></tr>`;
+    rows += `<tr class="head"><td>所得金額</td><td class="num"></td></tr>`;
+    rows += `<tr><td>青色申告特別控除前の所得金額</td><td class="num">${yenC(incomeBeforeBlue)}</td></tr>`;
+    rows += `<tr><td>− 青色申告特別控除</td><td class="num">${yenC(blue)}</td></tr>`;
+    rows += `<tr class="total"><td>所得金額</td><td class="num">${yenC(incomeAfterBlue)}</td></tr>`;
+    const body = `<h1>確定申告まとめ（${g.taxYear}年）</h1>
+      <div class="sub">サロねこ ／ 青色申告決算書（損益）ベース・金額は概算</div>
+      <table><tbody>${rows}</tbody></table>
+      <div class="note">※新聞図書費・その他固定費など決算書に無い科目は「雑費」へまとめています。<br>
+      ※金額はすべて概算です。最終的な申告・納税額は国税庁『確定申告書等作成コーナー』または税理士でご確認ください。</div>`;
+    printDoc(`確定申告まとめ_${g.taxYear}`, body);
+  };
+
   return (
     <div className="space-y-4">
       <Card className="p-5">
@@ -2531,7 +2625,7 @@ function TaxTab({ s, setS, m }) {
           </div>
           <div className="flex gap-2">
             <button onClick={exportCSV} className="bg-emerald-400 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">📄 CSVで書き出す</button>
-            <button onClick={() => window.print()} className="bg-stone-600 hover:bg-stone-700 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">🖨️ 印刷 / PDF</button>
+            <button onClick={printSummary} className="bg-stone-600 hover:bg-stone-700 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">🖨️ 印刷 / PDF</button>
           </div>
         </div>
         <div className="mt-4 bg-amber-50 text-amber-800 rounded-2xl p-4 text-sm">
@@ -2819,7 +2913,18 @@ function App() {
     try { localStorage.setItem('salon-finance-v1', JSON.stringify(s)); } catch (e) {}
   }, [s]);
 
-  const reset = () => { if (confirm('入力をすべて初期値に戻します。よろしいですか？')) setS(DEFAULT_STATE); };
+  const reset = () => {
+    if (!confirm('入力をすべて初期値に戻します。よろしいですか？')) return;
+    setS(JSON.parse(JSON.stringify(DEFAULT_STATE)));
+    try {
+      localStorage.removeItem('saloneko-onboarded');
+      localStorage.removeItem('saloneko-visited');
+    } catch (e) {}
+    setVisited(new Set());
+    setOnboarded(false);
+    setShowIntro(true);
+    setTab('dash');
+  };
 
   if (!gateOk) return <Gate onPass={() => setGateOk(true)} />;
   if (!onboarded || showIntro) return <Intro mascotType={s.settings.mascotType} onStart={startApp} />;
