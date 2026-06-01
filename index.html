@@ -54,6 +54,9 @@
   @keyframes nudge { 0%,100% { transform: translateX(0); } 50% { transform: translateX(6px); } }
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  /* マウス操作のPCだけで表示（スマホ/タブレットでは window.print() が不発なので隠す） */
+  .only-desktop { display: none; }
+  @media (hover: hover) and (pointer: fine) { .only-desktop { display: inline-flex; } }
   /* 印刷オーバーレイ（確定申告まとめ） */
   .print-sheet { color: #333; }
   .print-sheet h1 { font-size: 18px; margin: 0 0 4px; }
@@ -2782,10 +2785,10 @@ function PrintOverlay({ html, filename, onClose }) {
       <div className="bg-white w-full sm:max-w-lg max-h-[92vh] rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
         <div className="no-print flex gap-2 p-3 border-b border-stone-100 shrink-0">
           <button onClick={saveImage} disabled={busy} className="flex-1 bg-emerald-500 active:bg-emerald-600 disabled:opacity-60 text-white py-3 rounded-2xl font-bold">{busy ? '作成中…' : '📥 画像で保存・共有'}</button>
-          <button onClick={() => window.print()} className="px-4 bg-stone-600 active:bg-stone-700 text-white py-3 rounded-2xl font-bold text-sm">🖨️ 印刷</button>
+          <button onClick={() => window.print()} className="only-desktop px-4 bg-stone-600 active:bg-stone-700 text-white py-3 rounded-2xl font-bold text-sm items-center">🖨️ 印刷</button>
           <button onClick={onClose} className="px-4 bg-stone-100 active:bg-stone-200 text-stone-500 py-3 rounded-2xl font-bold text-sm">閉じる</button>
         </div>
-        <div className="no-print px-4 py-2 text-xs text-stone-400 text-center shrink-0">スマホは「画像で保存・共有」→<b>共有シートから「画像を保存」</b>。「印刷」はパソコン向けです。</div>
+        <div className="no-print px-4 py-2 text-xs text-stone-400 text-center shrink-0">「画像で保存・共有」→<b>共有シートから「画像を保存」または「ファイルに保存」</b>。そこから印刷もできます。</div>
         <div className="overflow-auto p-5">
           <div ref={sheetRef} className="print-sheet" dangerouslySetInnerHTML={{ __html: html }} />
         </div>
