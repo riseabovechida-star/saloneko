@@ -728,13 +728,33 @@ function printDoc(title, bodyHtml) {
   <div class="hint">iPhoneは「印刷」を押したあと、プレビューを<b>ピンチで広げる→共有→ファイルに保存</b>でPDFになります。</div>
   ${bodyHtml}
 </body></html>`;
+  // 隠しiframeで印刷（iOS Safari・デスクトップ両対応・ポップアップ不要）
+  try {
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;';
+    document.body.appendChild(iframe);
+    const doc = iframe.contentWindow.document;
+    doc.open(); doc.write(html); doc.close();
+    let done = false;
+    const fire = () => {
+      if (done) return;
+      try { iframe.contentWindow.focus(); iframe.contentWindow.print(); done = true; } catch (e) { /* onload/タイマーで再試行 */ }
+    };
+    iframe.onload = fire;
+    fire(); // 同期write後は多くの環境で即印刷できる（ユーザー操作のコンテキストを保つ）
+    setTimeout(() => { if (!done) printDocFallback(html); }, 1200); // どちらも不発なら新タブへ
+    setTimeout(() => { try { document.body.removeChild(iframe); } catch (e) {} }, 60000);
+  } catch (e) {
+    printDocFallback(html);
+  }
+}
+
+// フォールバック：Blob URLを新しいタブで開いて手動で印刷ボタンを押してもらう
+function printDocFallback(html) {
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   const win = window.open(url, '_blank');
-  if (!win) {
-    // ポップアップがブロックされた場合は同じタブで開く（戻るで復帰）
-    location.href = url;
-    return;
-  }
+  if (!win) location.href = url; // ポップアップ不可なら同じタブで開く
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
