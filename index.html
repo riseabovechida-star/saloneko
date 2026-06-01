@@ -234,8 +234,12 @@ function compute(s) {
   const ownerPay = isSole ? 0 : c.ownerSalary;
   const laborCost = staffLabor + ownerPay;
 
-  // 固定費
-  const fixedCost = c.rent + c.utilities + c.otherFixed + laborCost;
+  // 家事按分：自宅サロンの家賃・水道光熱は「事業に使う割合」だけを経費にする（既定100%）
+  const rentBiz = c.rent * (c.rentBizRate ?? 1);
+  const utilitiesBiz = c.utilities * (c.utilitiesBizRate ?? 1);
+
+  // 固定費（按分後の事業ぶんで計上）
+  const fixedCost = rentBiz + utilitiesBiz + c.otherFixed + laborCost;
 
   // 利益（個人事業主では＝事業所得・控除前 / 法人では税引前利益）
   const operatingProfit = monthlySales - variableCost - fixedCost;
@@ -376,8 +380,8 @@ function compute(s) {
     '仕入（材料費）': monthlySales * c.materialCostRate * 12,
     '給料賃金': annualStaffSalary,
     '法定福利費': annualStaffSalary * c.socialInsuranceRate,
-    '地代家賃': c.rent * 12,
-    '水道光熱費': c.utilities * 12,
+    '地代家賃': rentBiz * 12,
+    '水道光熱費': utilitiesBiz * 12,
     'その他固定費': c.otherFixed * 12,
   };
   if (!isSole) expenseByItem['役員報酬'] = c.ownerSalary * 12;
@@ -480,6 +484,8 @@ const DEFAULT_STATE = {
     otherVariableRate: 0.03,  // その他変動費（カード手数料等）
     rent: 200000,
     utilities: 50000,
+    rentBizRate: 1,           // 家賃の事業按分率（自宅サロン用・既定100%）
+    utilitiesBizRate: 1,      // 水道光熱の事業按分率（同上）
     otherFixed: 80000,        // 通信・広告・消耗品など
     staff: [
       { id: 1, name: 'スタイリストA', role: 'スタイリスト', monthlySalary: 280000 },
@@ -605,6 +611,29 @@ function ManField({ label, value, onChange, hint }) {
     <Field label={label} unit="万円" hint={hint}
       value={Math.round((value || 0) / 1000) / 10}
       onChange={(v) => onChange(Math.round((v || 0) * 10000))} />
+  );
+}
+
+// 家事按分つきフィールド：全額を入れて「うち事業◯%」だけを経費にする（自宅サロン用）
+function ApportionField({ label, value, rate, onAmount, onRate, hint }) {
+  const r = rate ?? 1;
+  const pctVal = Math.round(r * 100);
+  const biz = Math.round((value || 0) * r);
+  const personal = Math.round((value || 0) * (1 - r));
+  return (
+    <div>
+      <Field label={label} value={value} onChange={onAmount} hint={hint} />
+      <div className="mt-2 flex items-center gap-3 pl-1">
+        <span className="text-xs text-stone-400 shrink-0">うち仕事に使う割合</span>
+        <input type="range" min="0" max="100" step="5" value={pctVal}
+          onChange={(e) => onRate(parseInt(e.target.value, 10) / 100)}
+          className="flex-1 min-w-0 accent-rose-400" />
+        <span className="text-sm font-bold text-rose-400 tabnum shrink-0 w-12 text-right">{pctVal}%</span>
+      </div>
+      {pctVal < 100
+        ? <div className="text-xs text-emerald-600 mt-1.5 pl-1">経費にできるのは <b className="tabnum">{yen(biz)}</b>。残り <span className="tabnum">{yen(personal)}</span> は自宅ぶん → <b className="text-rose-400">「暮らしのお金」</b>で（二重計上を避けてね）</div>
+        : <div className="text-xs text-stone-300 mt-1.5 pl-1">自宅サロンなら、スライダーを動かして「仕事に使う割合」だけを経費にできるよ</div>}
+    </div>
   );
 }
 
@@ -1656,8 +1685,11 @@ function CostTab({ s, setS, m }) {
         <h3 className="font-bold text-stone-600 text-lg">毎月かかるお金</h3>
         <RateAmountField label="材料費（売れた分にかかる）" rate={c.materialCostRate} onChange={(v) => up({ materialCostRate: v })}
           amount={m.monthlySales * c.materialCostRate} step={0.5} hint="薬剤・カラー材などを売上に対してざっくり％で。例：6%" />
-        <Field label="家賃" value={c.rent} onChange={(v) => up({ rent: v })} />
-        <Field label="水道・電気・ガス" value={c.utilities} onChange={(v) => up({ utilities: v })} />
+        <ApportionField label="家賃" value={c.rent} rate={c.rentBizRate}
+          onAmount={(v) => up({ rent: v })} onRate={(v) => up({ rentBizRate: v })}
+          hint="自宅サロンは“家全体の家賃”を入れてOK" />
+        <ApportionField label="水道・電気・ガス" value={c.utilities} rate={c.utilitiesBizRate}
+          onAmount={(v) => up({ utilities: v })} onRate={(v) => up({ utilitiesBizRate: v })} />
         <Field label="その他（通信・広告・消耗品など）" value={c.otherFixed} onChange={(v) => up({ otherFixed: v })} hint="材料費はここに含めず、上の％で別管理します" />
         {m.isSole
           ? <div className="bg-peach rounded-xl p-3 text-sm text-stone-500">ご自身の取り分は、ここではなく<b className="text-rose-400">「暮らしのお金」</b>で管理します。</div>
