@@ -598,10 +598,33 @@ function buildJournal(s) {
     }
   });
 
-  /* J5 期首残高（1/1・元入金は差額＝BSCardと同式） */
+  /* J7 年中の設備購入（取得年が対象年の資産 → 購入仕訳。期首には入れない） */
+  const inYearAssets = (c.assets || []).filter((a) => parseInt((a.acquiredYM || '').slice(0, 4), 10) === year && (a.cost || 0) > 0);
+  inYearAssets.forEach((a) => {
+    push(`buy-${a.id}-${year}`, `${a.acquiredYM}-01`,
+      [{ account: ACCOUNTS.fixedAsset, amount: r0(a.cost) }],
+      [{ account: ACCOUNTS.cash, amount: r0(a.cost) }],
+      { type: 'asset-purchase', refId: String(a.id) }, `${a.label || '設備'} 購入`);
+  });
+
+  /* J8 借入の増減（期首→期末の差額・12/31に1本。明細が無いので年間純額） */
+  const _openLoan = r0(s.settings.bsOpenLoan);
+  const _endLoan = r0(s.settings.bsEndLoan);
+  const loanDiff = _endLoan - _openLoan;
+  if (loanDiff > 0) {
+    push(`loan-${year}`, `${year}-12-31`,
+      [{ account: ACCOUNTS.cash, amount: loanDiff }], [{ account: ACCOUNTS.loan, amount: loanDiff }],
+      { type: 'financing', refId: yearStr }, '借入の実行・増加（年間純額）');
+  } else if (loanDiff < 0) {
+    push(`loan-${year}`, `${year}-12-31`,
+      [{ account: ACCOUNTS.loan, amount: -loanDiff }], [{ account: ACCOUNTS.cash, amount: -loanDiff }],
+      { type: 'financing', refId: yearStr }, '借入の返済（年間純額・元本）');
+  }
+
+  /* J5 期首残高（1/1・元入金は差額＝BSCardと同式）※年中取得の資産はJ7で計上するため期首から除外 */
   const openCash = r0(s.settings.bsOpenCash);
-  const openLoan = r0(s.settings.bsOpenLoan);
-  const fixedBegin = r0((c.assets || []).reduce((a, x) => a + depreciate(x, year).bookBegin, 0));
+  const openLoan = _openLoan;
+  const fixedBegin = r0((c.assets || []).filter((a) => parseInt((a.acquiredYM || '').slice(0, 4), 10) < year).reduce((a, x) => a + depreciate(x, year).bookBegin, 0));
   const capital = openCash + fixedBegin - openLoan;
   if (capital < 0) issues.push({ level: 'warn', code: 'negative-capital', message: '期首の元入金がマイナス（負債が資産を上回っています）' });
   const debit5 = [], credit5 = [];
@@ -635,6 +658,71 @@ function buildJournal(s) {
   }
 
   return { year, entries, issues, totals: { debit: totalDebit, credit: totalCredit } };
+}
+
+/* ============================================================
+   ★ 決算3表の導出（B/S・P/L・C/F）— 金融機関提出用の下ごしらえ
+   buildJournal の仕訳から導出する純関数。
+   ・P/L＝実績ベース（毎日入力＋レシート＋月次固定費＋減価償却）
+   ・B/S＝期末残高。事業主貸/借を差額で自動釣り合わせ（BSCardと同方式）
+   ・C/F＝直接法の簡易版（営業/投資/財務＋事業主とのやりとり）。現金期末は実際の現預金に必ず一致
+   ============================================================ */
+function buildStatements(s) {
+  const j = buildJournal(s);
+  const year = j.year;
+  const c = s.current;
+  const g = s.settings;
+  const r0 = (n) => Math.round(n || 0);
+  const sum = (xs) => xs.reduce((a, x) => a + x.amount, 0);
+
+  /* ---- P/L（実績） ---- */
+  let sales = 0;
+  const expenseByAccount = {};
+  let purchases = 0, opOut = 0;
+  j.entries.forEach((e) => {
+    if (e.source.type === 'daily') sales += sum(e.credit);
+    if (e.source.type === 'receipt' || e.source.type === 'monthly-fixed' || e.source.type === 'depreciation') {
+      e.debit.forEach((x) => { expenseByAccount[x.account] = (expenseByAccount[x.account] || 0) + x.amount; });
+    }
+    if (e.source.type === 'receipt' || e.source.type === 'monthly-fixed') opOut += sum(e.debit); // 現金の出（減価償却は非資金）
+    if (e.source.type === 'asset-purchase') purchases += sum(e.debit);
+  });
+  const totalExpense = Object.values(expenseByAccount).reduce((a, v) => a + v, 0);
+  const profit = sales - totalExpense; // 青色控除前・実績ベース
+
+  /* ---- C/F（簡易直接法・現金は実際の残高に一致させる） ---- */
+  const openCash = r0(g.bsOpenCash);
+  const openLoan = r0(g.bsOpenLoan);
+  const endLoan = r0(g.bsEndLoan);
+  const cfOperating = sales - opOut;
+  const cfInvesting = -purchases;
+  const cfFinancing = endLoan - openLoan;
+  const cashPerBooks = openCash + cfOperating + cfInvesting + cfFinancing;
+  const cashActual = r0(c.cashOnHand);
+  const cfOwner = cashActual - cashPerBooks; // −=生活費などの引き出し / ＋=個人からの補填（自動調整）
+  const cashEnd = cashActual;
+
+  /* ---- B/S（期末・事業主貸/借で釣り合わせ） ---- */
+  const fixedEnd = r0((c.assets || []).reduce((a, x) => a + depreciate(x, year).bookEnd, 0));
+  const fixedBegin = r0((c.assets || []).filter((a) => parseInt((a.acquiredYM || '').slice(0, 4), 10) < year).reduce((a, x) => a + depreciate(x, year).bookBegin, 0));
+  const recv = r0(g.bsReceivableEnd);
+  const capital = openCash + fixedBegin - openLoan; // 元入金（期首）
+  const net = (endLoan + capital + profit) - (cashActual + recv + fixedEnd); // ＞0なら事業主貸（資産側）
+  const ownerLoan = net > 0 ? net : 0;     // 事業主貸
+  const ownerBorrow = net < 0 ? -net : 0;  // 事業主借
+  const assetTotal = cashActual + recv + fixedEnd + ownerLoan;
+  const liabEquityTotal = endLoan + capital + profit + ownerBorrow;
+  const balanced = Math.abs(assetTotal - liabEquityTotal) < 1;
+
+  return {
+    year, journal: j, issues: j.issues, balanced,
+    pl: { sales, expenseByAccount, totalExpense, profit },
+    bs: {
+      assets: { cash: cashActual, receivable: recv, fixedAsset: fixedEnd, ownerLoan, total: assetTotal },
+      liabEquity: { loan: endLoan, capital, profit, ownerBorrow, total: liabEquityTotal },
+    },
+    cf: { openCash, operating: cfOperating, investing: cfInvesting, financing: cfFinancing, owner: cfOwner, cashEnd },
+  };
 }
 
 /* ============================================================
@@ -2514,12 +2602,150 @@ function Row({ label, v, sub }) {
 }
 
 /* ============================================================
+   🏦 金融機関に出す書類（B/S・P/L・C/F）— 経営プラン先行公開
+   buildStatements から導出。画像保存・CSV書き出し対応
+   ============================================================ */
+function FinancialDocsCard({ s, setS }) {
+  const [printView, setPrintView] = useState(null);
+  const [showBsSettings, setShowBsSettings] = useState(false);
+  const st = useMemo(() => buildStatements(s), [s]);
+  const g = s.settings;
+  const upG = (patch) => setS({ ...s, settings: { ...g, ...patch } });
+  const warns = st.issues.filter((i) => i.level === 'warn');
+
+  const SRow = ({ label, v, strong, indent, minus }) => (
+    <div className={'flex justify-between items-baseline py-1 ' + (indent ? 'pl-3' : '')}>
+      <span className={'text-sm ' + (strong ? 'font-bold text-stone-700' : 'text-stone-500')}>{label}</span>
+      <span className={'tabnum text-sm ' + (strong ? 'font-bold text-stone-700' : v < 0 || minus ? 'text-rose-500' : 'text-stone-600')}>{yen(v)}</span>
+    </div>
+  );
+
+  const exportCSV = () => {
+    const rows = [['表', '項目', '金額（円）']];
+    rows.push(['P/L', '売上高（実績）', Math.round(st.pl.sales)]);
+    Object.entries(st.pl.expenseByAccount).forEach(([k, v]) => rows.push(['P/L', '経費：' + k, Math.round(v)]));
+    rows.push(['P/L', '経費計', Math.round(st.pl.totalExpense)]);
+    rows.push(['P/L', '利益（青色控除前）', Math.round(st.pl.profit)]);
+    rows.push(['B/S', '現金・預金', Math.round(st.bs.assets.cash)]);
+    if (st.bs.assets.receivable > 0) rows.push(['B/S', '売掛金', Math.round(st.bs.assets.receivable)]);
+    rows.push(['B/S', '固定資産（償却後）', Math.round(st.bs.assets.fixedAsset)]);
+    if (st.bs.assets.ownerLoan > 0) rows.push(['B/S', '事業主貸（自動調整）', Math.round(st.bs.assets.ownerLoan)]);
+    rows.push(['B/S', '資産合計', Math.round(st.bs.assets.total)]);
+    if (st.bs.liabEquity.loan > 0) rows.push(['B/S', '借入金', Math.round(st.bs.liabEquity.loan)]);
+    rows.push(['B/S', '元入金', Math.round(st.bs.liabEquity.capital)]);
+    rows.push(['B/S', '当期利益', Math.round(st.bs.liabEquity.profit)]);
+    if (st.bs.liabEquity.ownerBorrow > 0) rows.push(['B/S', '事業主借（自動調整）', Math.round(st.bs.liabEquity.ownerBorrow)]);
+    rows.push(['B/S', '負債・資本合計', Math.round(st.bs.liabEquity.total)]);
+    rows.push(['C/F', '期首の現金・預金', Math.round(st.cf.openCash)]);
+    rows.push(['C/F', '営業キャッシュフロー', Math.round(st.cf.operating)]);
+    rows.push(['C/F', '投資キャッシュフロー（設備購入）', Math.round(st.cf.investing)]);
+    rows.push(['C/F', '財務キャッシュフロー（借入の増減）', Math.round(st.cf.financing)]);
+    rows.push(['C/F', '事業主とのやりとり（生活費など・自動調整）', Math.round(st.cf.owner)]);
+    rows.push(['C/F', '期末の現金・預金', Math.round(st.cf.cashEnd)]);
+    const csv = '﻿' + rows.map((r) => r.join(',')).join('\n');
+    saveCSV(`決算書類_BS_PL_CF_${st.year}.csv`, csv);
+  };
+
+  const printDocs = () => {
+    const yenC = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+    const tr = (l, v, cls) => `<tr class="${cls || ''}"><td>${l}</td><td class="num">${yenC(v)}</td></tr>`;
+    let body = `<h1>決算書類（${st.year}年・概算）</h1><div class="sub">サロねこ ／ 実績ベースの下ごしらえ（B/S・P/L・C/F）</div>`;
+    body += `<table><tbody><tr class="head"><td>損益計算書（P/L）</td><td class="num"></td></tr>`;
+    body += tr('売上高（実績）', st.pl.sales);
+    Object.entries(st.pl.expenseByAccount).forEach(([k, v]) => { body += tr('　' + k, v); });
+    body += tr('経費計', st.pl.totalExpense);
+    body += tr('利益（青色申告特別控除前）', st.pl.profit, 'total') + '</tbody></table>';
+    body += `<table><tbody><tr class="head"><td>貸借対照表（B/S・期末）</td><td class="num"></td></tr>`;
+    body += tr('現金・預金', st.bs.assets.cash);
+    if (st.bs.assets.receivable > 0) body += tr('売掛金', st.bs.assets.receivable);
+    body += tr('固定資産（償却後）', st.bs.assets.fixedAsset);
+    if (st.bs.assets.ownerLoan > 0) body += tr('事業主貸', st.bs.assets.ownerLoan);
+    body += tr('資産合計', st.bs.assets.total, 'total');
+    if (st.bs.liabEquity.loan > 0) body += tr('借入金', st.bs.liabEquity.loan);
+    body += tr('元入金', st.bs.liabEquity.capital);
+    body += tr('当期利益', st.bs.liabEquity.profit);
+    if (st.bs.liabEquity.ownerBorrow > 0) body += tr('事業主借', st.bs.liabEquity.ownerBorrow);
+    body += tr('負債・資本合計', st.bs.liabEquity.total, 'total') + '</tbody></table>';
+    body += `<table><tbody><tr class="head"><td>キャッシュフロー計算書（C/F・簡易直接法）</td><td class="num"></td></tr>`;
+    body += tr('期首の現金・預金', st.cf.openCash);
+    body += tr('営業キャッシュフロー', st.cf.operating);
+    body += tr('投資キャッシュフロー（設備購入）', st.cf.investing);
+    body += tr('財務キャッシュフロー（借入の増減）', st.cf.financing);
+    body += tr('事業主とのやりとり（生活費など・自動調整）', st.cf.owner);
+    body += tr('期末の現金・預金', st.cf.cashEnd, 'total') + '</tbody></table>';
+    body += `<div class="note">※サロねこの入力（毎日入力・レシート・お店の費用・固定資産・期首残高）から自動作成した概算・実績ベースの資料です。<br>※事業主貸/借・事業主とのやりとりは差額からの自動調整です。提出前に税理士・会計士にご確認ください。</div>`;
+    setPrintView(body);
+  };
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <h3 className="font-bold text-stone-600">🏦 金融機関に出す書類（B/S・P/L・C/F）</h3>
+        <span className="text-[10px] font-bold bg-amber-50 text-amber-600 border border-amber-200 rounded-full px-2.5 py-1">✨ 経営プラン（将来の有料機能）を先行公開中</span>
+      </div>
+      <p className="text-sm text-stone-400 mb-3">融資の相談で「決算書を見せて」と言われたら、ここ。毎日の入力から<b>3つの表</b>をいっしょに用意しておいたよ。{st.year}年・実績ベース。</p>
+
+      <div className="grid md:grid-cols-3 gap-3">
+        <div className="bg-sky-50 rounded-2xl px-4 py-3">
+          <div className="text-xs text-sky-600 font-bold mb-1">📈 損益（P/L）</div>
+          <SRow label="売上高（実績）" v={st.pl.sales} />
+          <SRow label="経費計" v={-st.pl.totalExpense} minus />
+          <div className="border-t border-sky-200 mt-1"><SRow label="利益（控除前）" v={st.pl.profit} strong /></div>
+        </div>
+        <div className="bg-rose-50 rounded-2xl px-4 py-3">
+          <div className="text-xs text-rose-500 font-bold mb-1">⚖️ 貸借（B/S・期末）</div>
+          <SRow label="資産合計" v={st.bs.assets.total} strong />
+          <SRow label="うち現金・預金" v={st.bs.assets.cash} indent />
+          <SRow label="うち固定資産" v={st.bs.assets.fixedAsset} indent />
+          <div className={'text-[11px] font-bold mt-1 ' + (st.balanced ? 'text-emerald-600' : 'text-amber-600')}>{st.balanced ? '✓ 貸借バランスOK' : '⚠️ バランスがずれています'}</div>
+        </div>
+        <div className="bg-emerald-50 rounded-2xl px-4 py-3">
+          <div className="text-xs text-emerald-600 font-bold mb-1">💧 お金の流れ（C/F）</div>
+          <SRow label="営業CF" v={st.cf.operating} />
+          <SRow label="投資CF" v={st.cf.investing} minus />
+          <SRow label="財務CF" v={st.cf.financing} />
+          <div className="border-t border-emerald-200 mt-1"><SRow label="期末の現金" v={st.cf.cashEnd} strong /></div>
+        </div>
+      </div>
+
+      {warns.length > 0 && (
+        <div className="mt-3 bg-amber-50 text-amber-700 rounded-2xl p-3 text-xs space-y-0.5">
+          {warns.map((w) => <div key={w.code}>・{w.message}</div>)}
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button onClick={printDocs} className="flex-1 min-w-[10rem] bg-stone-600 hover:bg-stone-700 text-white px-4 py-3 rounded-2xl font-bold text-sm">🖨️ 3表まとめて 画像/印刷</button>
+        <button onClick={exportCSV} className="flex-1 min-w-[10rem] bg-emerald-400 hover:bg-emerald-500 text-white px-4 py-3 rounded-2xl font-bold text-sm">📄 CSVで書き出す</button>
+      </div>
+
+      <button onClick={() => setShowBsSettings(!showBsSettings)} className="mt-3 text-xs text-stone-400 hover:text-rose-400">
+        {showBsSettings ? '▲ 期首・期末の残高設定を閉じる' : '▼ 期首・期末の残高を直す（現金・借入・売掛）'}
+      </button>
+      {showBsSettings && (
+        <div className="mt-3 grid sm:grid-cols-2 gap-x-6 gap-y-3 border-t border-stone-100 pt-3">
+          <Field label="期首（1/1）の現金・預金" value={g.bsOpenCash} onChange={(v) => upG({ bsOpenCash: v })} step={10000} hint="昨年末＝今年初めの残高" />
+          <Field label="期首（1/1）の借入金" value={g.bsOpenLoan} onChange={(v) => upG({ bsOpenLoan: v })} step={10000} hint="無ければ0" />
+          <Field label="期末（12/31）の借入金" value={g.bsEndLoan} onChange={(v) => upG({ bsEndLoan: v })} step={10000} hint="年末の残高見込み。無ければ0" />
+          <Field label="期末（12/31）の売掛金" value={g.bsReceivableEnd} onChange={(v) => upG({ bsReceivableEnd: v })} step={10000} hint="未入金のカード売上など。無ければ0" />
+        </div>
+      )}
+
+      <p className="text-xs text-stone-400 mt-3">※毎日入力・レシート・お店の費用から自動で作る<b>概算・実績ベースの下ごしらえ</b>です。「事業主貸/借」「事業主とのやりとり」は差額の自動調整。提出前に税理士・会計士の確認をおすすめします。期末の現金は「お店の費用」の現預金を使います。</p>
+
+      {printView && <PrintOverlay html={printView} filename={`決算書類_${st.year}`} onClose={() => setPrintView(null)} />}
+    </Card>
+  );
+}
+
+/* ============================================================
    タブ：借入シミュレーション
    ============================================================ */
 function LoanTab({ s, setS, m }) {
   const L = s.loan;
   const up = (patch) => setS({ ...s, loan: { ...L, ...patch } });
   return (
+    <div className="space-y-4">
     <div className="grid md:grid-cols-2 gap-4">
       <Card className="p-5 space-y-4">
         <h3 className="font-bold text-stone-600">借入条件</h3>
@@ -2574,6 +2800,8 @@ function LoanTab({ s, setS, m }) {
             </div>}
         </Card>
       </div>
+    </div>
+    <FinancialDocsCard s={s} setS={setS} />
     </div>
   );
 }
