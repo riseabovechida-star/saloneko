@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<title>サロねこレジ — タブレットPOS</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = { theme: { extend: {
+    fontFamily: { sans: ['"M PLUS Rounded 1c"', 'sans-serif'] },
+    colors: { cream: '#fbf7f3', peach: '#fff1ea', blush: '#ffe4e0' },
+    boxShadow: { soft: '0 6px 24px -8px rgba(180,140,120,0.25)' },
+  } } };
+</script>
+<style>
+  body { font-family: "M PLUS Rounded 1c", -apple-system, "Hiragino Maru Gothic ProN", sans-serif; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+  .tabnum { font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { height: 10px; width: 10px; }
+  ::-webkit-scrollbar-thumb { background: #e7d8cf; border-radius: 99px; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  .fadein { animation: fadein .25s ease; } @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .popin { animation: popin .3s cubic-bezier(.2,1.3,.4,1); } @keyframes popin { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: none; } }
+  .receipt { color:#333; font-family: -apple-system, 'Hiragino Kaku Gothic ProN', sans-serif; }
+  .receipt .r-row { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; }
+  .receipt .r-line { border-top:1px dashed #bbb; margin:6px 0; }
+</style>
+</head>
+<body class="bg-cream text-stone-700">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ============================================================
+   サロねこレジ（POS）— タブレット会計
+   ・予約台帳(saloneko-yoyaku-v1)から「今日の来店」を呼び出して会計
+   ・会計完了でサロねこ本体(salon-finance-v1)の毎日入力へ売上連携
+   ・予約台帳の「来店」で既に連携済みなら、その分を差し引いてから正味を計上（二重計上防止）
+   ============================================================ */
+const REZI_KEY = 'saloneko-rezi-v1';
+const YOYAKU_KEY = 'saloneko-yoyaku-v1';
+const SALONEKO_KEY = 'salon-finance-v1';
+
+const yen = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+const pad2 = (n) => String(n).padStart(2, '0');
+const now = () => new Date();
+const todayStr = () => { const d = now(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const nowHHMM = () => { const d = now(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const uid = (p) => p + Math.random().toString(36).slice(2, 9);
+const WD = ['日', '月', '火', '水', '木', '金', '土'];
+const fmtDate = (ds) => { const [y, m, d] = ds.split('-').map(Number); return `${m}月${d}日(${WD[new Date(y, m - 1, d).getDay()]})`; };
+
+const PAYMENTS = [
+  { id: 'cash', label: '現金', icon: '💴' },
+  { id: 'card', label: 'カード', icon: '💳' },
+  { id: 'emoney', label: '電子マネー', icon: '📱' },
+  { id: 'other', label: 'その他', icon: '🎫' },
+];
+const payLabel = (id) => (PAYMENTS.find((p) => p.id === id) || { label: id }).label;
+
+const DEFAULT_STATE = {
+  settings: { storeName: 'サロねこレジ', taxRate: 0.10, linkSaloneko: true },
+  products: [
+    { id: 'p1', name: 'シャンプー（店販）', price: 2800 },
+    { id: 'p2', name: 'トリートメント（店販）', price: 3200 },
+    { id: 'p3', name: 'スタイリング剤', price: 2200 },
+  ],
+  sales: [], // { id,date,time,bookingId,customerName,items[],discount,subtotal,tax,total,method,received,change,void }
+};
+
+/* ---- 他アプリのlocalStorage読み書き（同一オリジン） ---- */
+const readJSON = (k) => { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch (e) { return null; } };
+const writeJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } };
+const salonekoAvailable = () => readJSON(SALONEKO_KEY) != null;
+const yoyakuAvailable = () => readJSON(YOYAKU_KEY) != null;
+
+// サロねこ本体のdailySalesへ増減（grossDelta・客数delta）
+function adjustSaloneko(date, grossDelta, custDelta) {
+  const s = readJSON(SALONEKO_KEY);
+  if (!s || !s.current) return false;
+  const list = s.current.dailySales || [];
+  const idx = list.findIndex((x) => x.date === date);
+  if (idx >= 0) {
+    const cur = list[idx];
+    const g = (cur.gross != null ? cur.gross : cur.amount) || 0;
+    list[idx] = { date, gross: Math.max(0, g + grossDelta), customers: Math.max(0, (cur.customers || 0) + custDelta) };
+  } else if (grossDelta > 0) {
+    list.push({ date, gross: Math.max(0, grossDelta), customers: Math.max(0, custDelta) });
+  }
+  s.current.dailySales = list.sort((a, b) => a.date.localeCompare(b.date));
+  return writeJSON(SALONEKO_KEY, s);
+}
+
+// 予約台帳のbookingを会計済みに（status=done, pushed=true, paidTotal）
+function markBookingPaid(bookingId, paidTotal) {
+  const y = readJSON(YOYAKU_KEY);
+  if (!y || !y.bookings) return;
+  y.bookings = y.bookings.map((b) => b.id === bookingId ? { ...b, status: 'done', pushed: true, paidTotal } : b);
+  writeJSON(YOYAKU_KEY, y);
+}
+
+/* ============================================================
+   共通UI
+   ============================================================ */
+function Modal({ children, onClose, wide }) {
+  useEffect(() => { document.body.classList.add('overflow-hidden'); return () => document.body.classList.remove('overflow-hidden'); }, []);
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-900/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className={'bg-white rounded-3xl shadow-soft w-full ' + (wide ? 'max-w-2xl' : 'max-w-md') + ' max-h-[92vh] overflow-auto popin'} onClick={(e) => e.stopPropagation()}>{children}</div>
+    </div>
+  );
+}
+
+/* ============================================================
+   支払いモーダル（現金はつり銭計算）
+   ============================================================ */
+function PaymentModal({ total, onDone, onClose }) {
+  const [method, setMethod] = useState('cash');
+  const [received, setReceived] = useState(0);
+  const change = received - total;
+  const quick = [total, Math.ceil(total / 1000) * 1000, Math.ceil(total / 5000) * 5000, Math.ceil(total / 10000) * 10000];
+  const quickUniq = [...new Set(quick)].filter((v) => v >= total);
+  const tap = (d) => setReceived((r) => r * 10 + d);
+  const canPay = method !== 'cash' || received >= total;
+  return (
+    <Modal onClose={onClose}>
+      <div className="p-5">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="text-lg font-extrabold text-stone-700">お会計</h3>
+          <div className="text-2xl font-extrabold text-rose-500 tabnum">{yen(total)}</div>
+        </div>
+        <div className="grid grid-cols-4 gap-2 mb-4">
+          {PAYMENTS.map((p) => (
+            <button key={p.id} onClick={() => setMethod(p.id)}
+              className={'py-3 rounded-2xl font-bold text-sm border-2 ' + (method === p.id ? 'bg-rose-400 text-white border-rose-400' : 'bg-stone-50 text-stone-500 border-stone-200')}>
+              <div className="text-xl">{p.icon}</div>{p.label}
+            </button>
+          ))}
+        </div>
+
+        {method === 'cash' ? (
+          <div>
+            <div className="bg-stone-50 rounded-2xl p-4 mb-3">
+              <div className="flex justify-between text-sm text-stone-500"><span>お預かり</span><span className="tabnum text-xl font-extrabold text-stone-700">{yen(received)}</span></div>
+              <div className="flex justify-between text-sm mt-1"><span className="text-stone-500">おつり</span><span className={'tabnum text-2xl font-extrabold ' + (change >= 0 ? 'text-emerald-500' : 'text-stone-300')}>{change >= 0 ? yen(change) : '—'}</span></div>
+            </div>
+            <div className="flex flex-wrap gap-2 mb-2">
+              {quickUniq.map((v) => <button key={v} onClick={() => setReceived(v)} className="flex-1 min-w-[5rem] py-2.5 rounded-xl bg-peach text-rose-500 font-bold tabnum">{yen(v)}</button>)}
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {[1,2,3,4,5,6,7,8,9].map((d) => <button key={d} onClick={() => tap(d)} className="py-4 rounded-xl bg-stone-100 text-xl font-extrabold tabnum active:bg-stone-200">{d}</button>)}
+              <button onClick={() => setReceived((r) => r * 100)} className="py-4 rounded-xl bg-stone-100 text-lg font-bold tabnum active:bg-stone-200">00</button>
+              <button onClick={() => tap(0)} className="py-4 rounded-xl bg-stone-100 text-xl font-extrabold tabnum active:bg-stone-200">0</button>
+              <button onClick={() => setReceived(0)} className="py-4 rounded-xl bg-stone-100 text-base font-bold text-rose-400 active:bg-stone-200">C</button>
+            </div>
+          </div>
+        ) : (
+          <div className="bg-peach rounded-2xl p-4 text-sm text-stone-500 mb-2">{payLabel(method)}で <b className="text-rose-500 tabnum">{yen(total)}</b> を受け取ってください。</div>
+        )}
+
+        <div className="mt-4 flex gap-2">
+          <button onClick={onClose} className="px-4 py-3.5 rounded-2xl bg-stone-100 text-stone-500 font-bold">もどる</button>
+          <button onClick={() => onDone({ method, received: method === 'cash' ? received : total, change: method === 'cash' ? change : 0 })}
+            disabled={!canPay}
+            className={'flex-1 py-3.5 rounded-2xl font-extrabold text-white ' + (canPay ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-stone-200')}>
+            会計完了 ✓
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   レシート（画像保存・印刷）
+   ============================================================ */
+function Receipt({ sale, storeName, taxRate, onClose }) {
+  const ref = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const saveImage = async () => {
+    if (!window.html2canvas || !ref.current) { window.print(); return; }
+    setBusy(true);
+    try {
+      const canvas = await window.html2canvas(ref.current, { backgroundColor: '#fff', scale: 2 });
+      const blob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+      const file = new File([blob], `レシート_${sale.date}_${sale.time.replace(':', '')}.png`, { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+      else { const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = file.name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    } catch (e) {}
+    setBusy(false);
+  };
+  return (
+    <Modal onClose={onClose}>
+      <div className="p-5">
+        <div ref={ref} className="receipt bg-white p-4">
+          <div style={{ textAlign: 'center', fontWeight: 800, fontSize: 16 }}>{storeName}</div>
+          <div style={{ textAlign: 'center', fontSize: 12, color: '#888' }}>{sale.date} {sale.time}</div>
+          {sale.customerName && <div style={{ fontSize: 12, marginTop: 6 }}>{sale.customerName} 様</div>}
+          <div className="r-line" />
+          {sale.items.map((it, i) => (
+            <div key={i} className="r-row"><span>{it.name}{it.qty > 1 ? ` ×${it.qty}` : ''}</span><span className="tabnum">{yen(it.price * it.qty)}</span></div>
+          ))}
+          <div className="r-line" />
+          {sale.discount > 0 && <div className="r-row"><span>値引き</span><span className="tabnum">-{yen(sale.discount)}</span></div>}
+          <div className="r-row" style={{ fontWeight: 800, fontSize: 15 }}><span>合計</span><span className="tabnum">{yen(sale.total)}</span></div>
+          <div className="r-row" style={{ color: '#888', fontSize: 11 }}><span>（内 消費税{Math.round(taxRate * 100)}%）</span><span className="tabnum">{yen(sale.tax)}</span></div>
+          <div className="r-line" />
+          <div className="r-row"><span>{payLabel(sale.method)}</span><span className="tabnum">{yen(sale.received)}</span></div>
+          {sale.method === 'cash' && <div className="r-row"><span>おつり</span><span className="tabnum">{yen(sale.change)}</span></div>}
+          <div style={{ textAlign: 'center', fontSize: 11, color: '#888', marginTop: 8 }}>ありがとうございました</div>
+        </div>
+        <div className="mt-4 flex gap-2 no-print">
+          <button onClick={saveImage} disabled={busy} className="flex-1 bg-stone-600 text-white py-3 rounded-2xl font-bold">{busy ? '作成中…' : '🧾 レシートを画像/印刷'}</button>
+          <button onClick={onClose} className="px-5 bg-rose-400 text-white py-3 rounded-2xl font-extrabold">閉じる</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   会計画面（メイン）
+   ============================================================ */
+function Register({ s, setS, onSold }) {
+  const [cart, setCart] = useState([]); // {key,name,price,qty,kind}
+  const [customerName, setCustomerName] = useState('');
+  const [bookingId, setBookingId] = useState(null);
+  const [bookingPushed, setBookingPushed] = useState(false); // 予約台帳の来店で既に連携済みか
+  const [bookingPrice, setBookingPrice] = useState(0);
+  const [discount, setDiscount] = useState(0);
+  const [pay, setPay] = useState(false);
+
+  // 予約台帳から「今日の会計待ち」（来店済みでない or 来店済みだが会計未）
+  const yoyaku = readJSON(YOYAKU_KEY);
+  const menus = (yoyaku && yoyaku.menus) || [];
+  const todays = ((yoyaku && yoyaku.bookings) || []).filter((b) => b.date === todayStr() && b.status !== 'cancel' && b.status !== 'noshow');
+  const waiting = todays.filter((b) => !(s.sales || []).some((sl) => sl.bookingId === b.id && !sl.void));
+
+  const addItem = (name, price, kind) => setCart((c) => {
+    const key = kind + ':' + name;
+    const ex = c.find((x) => x.key === key);
+    if (ex) return c.map((x) => x.key === key ? { ...x, qty: x.qty + 1 } : x);
+    return [...c, { key, name, price, qty: 1, kind }];
+  });
+  const incr = (key, d) => setCart((c) => c.flatMap((x) => x.key === key ? (x.qty + d <= 0 ? [] : [{ ...x, qty: x.qty + d }]) : [x]));
+  const clear = () => { setCart([]); setCustomerName(''); setBookingId(null); setBookingPushed(false); setBookingPrice(0); setDiscount(0); };
+
+  const loadBooking = (b) => {
+    const sn = (yoyaku.staff.find((x) => x.id === b.staffId) || {}).name || '';
+    setCustomerName(b.name || '');
+    setBookingId(b.id); setBookingPushed(!!b.pushed); setBookingPrice(b.price || 0);
+    setCart(b.menu ? [{ key: 'menu:' + b.menu, name: b.menu, price: b.price || 0, qty: 1, kind: 'menu' }] : []);
+    setDiscount(0);
+  };
+
+  const subtotal = cart.reduce((a, x) => a + x.price * x.qty, 0);
+  const total = Math.max(0, subtotal - discount);
+  const tax = Math.round(total - total / (1 + s.settings.taxRate));
+
+  const complete = (payInfo) => {
+    const sale = {
+      id: uid('sale'), date: todayStr(), time: nowHHMM(), bookingId,
+      customerName, items: cart.map(({ name, price, qty, kind }) => ({ name, price, qty, kind })),
+      discount, subtotal, tax, total, ...payInfo, void: false,
+    };
+    // サロねこ連携：予約台帳の来店で既に bookingPrice を計上済みなら一旦戻してから total を計上
+    if (s.settings.linkSaloneko && salonekoAvailable()) {
+      if (bookingId && bookingPushed && bookingPrice > 0) adjustSaloneko(sale.date, -bookingPrice, -1);
+      adjustSaloneko(sale.date, total, +1);
+    }
+    if (bookingId) markBookingPaid(bookingId, total);
+    setS({ ...s, sales: [sale, ...(s.sales || [])] });
+    setPay(false);
+    onSold(sale);
+    clear();
+  };
+
+  return (
+    <div className="grid lg:grid-cols-[1fr_22rem] gap-3">
+      {/* 左：会計待ち＋商品タイル */}
+      <div className="space-y-3">
+        {waiting.length > 0 && (
+          <div className="bg-white rounded-3xl shadow-soft border border-stone-100 p-3">
+            <h3 className="font-bold text-stone-600 text-sm mb-2">今日の会計待ち（予約から呼び出す）</h3>
+            <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+              {waiting.map((b) => (
+                <button key={b.id} onClick={() => loadBooking(b)}
+                  className={'shrink-0 rounded-2xl px-3 py-2 border-2 text-left ' + (bookingId === b.id ? 'border-rose-300 bg-peach' : 'border-stone-200 bg-stone-50')}>
+                  <div className="text-sm font-extrabold text-stone-700">{b.start} {b.name || '（名前なし）'}</div>
+                  <div className="text-xs text-stone-400">{b.menu} {b.price ? yen(b.price) : ''}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {menus.length > 0 && (
+          <div className="bg-white rounded-3xl shadow-soft border border-stone-100 p-3">
+            <h3 className="font-bold text-stone-600 text-sm mb-2">メニュー</h3>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {menus.map((mn) => (
+                <button key={mn.id} onClick={() => addItem(mn.name, mn.price, 'menu')} className="rounded-2xl p-3 bg-peach hover:bg-blush text-left border border-rose-100">
+                  <div className="font-bold text-stone-700 text-sm leading-tight">{mn.name}</div>
+                  <div className="tabnum text-rose-500 font-extrabold mt-1">{yen(mn.price)}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="bg-white rounded-3xl shadow-soft border border-stone-100 p-3">
+          <h3 className="font-bold text-stone-600 text-sm mb-2">店販・物販</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {(s.products || []).map((p) => (
+              <button key={p.id} onClick={() => addItem(p.name, p.price, 'product')} className="rounded-2xl p-3 bg-sky-50 hover:bg-sky-100 text-left border border-sky-100">
+                <div className="font-bold text-stone-700 text-sm leading-tight">{p.name}</div>
+                <div className="tabnum text-sky-600 font-extrabold mt-1">{yen(p.price)}</div>
+              </button>
+            ))}
+            {(!s.products || s.products.length === 0) && <div className="col-span-full text-center text-stone-300 text-sm py-3">設定で店販商品を登録できます</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* 右：カート＋会計 */}
+      <div className="bg-white rounded-3xl shadow-soft border border-stone-100 p-4 flex flex-col lg:sticky lg:top-3 lg:self-start" style={{ minHeight: '60vh' }}>
+        <input value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="お客さま名（任意）"
+          className="border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base mb-2" />
+        <div className="flex-1 overflow-auto -mx-1 px-1">
+          {cart.length === 0 && <div className="text-center text-stone-300 py-10 text-sm">メニュー・店販をタップして<br />会計に追加してください</div>}
+          {cart.map((x) => (
+            <div key={x.key} className="flex items-center gap-2 py-2 border-b border-stone-100">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-bold text-stone-700 truncate">{x.name}</div>
+                <div className="text-xs text-stone-400 tabnum">{yen(x.price)} × {x.qty}</div>
+              </div>
+              <button onClick={() => incr(x.key, -1)} className="w-8 h-8 rounded-lg bg-stone-100 font-bold text-stone-500">−</button>
+              <span className="w-6 text-center tabnum font-bold">{x.qty}</span>
+              <button onClick={() => incr(x.key, +1)} className="w-8 h-8 rounded-lg bg-stone-100 font-bold text-rose-400">＋</button>
+              <span className="w-16 text-right tabnum font-bold text-stone-700">{yen(x.price * x.qty)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="pt-2 mt-2 border-t-2 border-stone-100 space-y-1.5">
+          <div className="flex justify-between text-sm text-stone-500"><span>小計</span><span className="tabnum">{yen(subtotal)}</span></div>
+          <div className="flex justify-between items-center text-sm">
+            <span className="text-stone-500">値引き</span>
+            <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-lg overflow-hidden">
+              <span className="pl-2 text-stone-300 text-xs">¥</span>
+              <input type="number" inputMode="numeric" value={discount || ''} placeholder="0" step={100}
+                onChange={(e) => setDiscount(Math.max(0, parseInt(e.target.value, 10) || 0))}
+                className="w-20 px-1 py-1.5 text-right tabnum bg-transparent outline-none" />
+            </div>
+          </div>
+          <div className="flex justify-between items-baseline">
+            <span className="font-bold text-stone-700">合計</span>
+            <span className="text-3xl font-extrabold text-rose-500 tabnum">{yen(total)}</span>
+          </div>
+          <div className="text-right text-[11px] text-stone-400">（内 消費税 {yen(tax)}）</div>
+        </div>
+        <div className="flex gap-2 mt-3">
+          <button onClick={clear} disabled={!cart.length} className="px-4 py-3.5 rounded-2xl bg-stone-100 text-stone-500 font-bold disabled:opacity-40">クリア</button>
+          <button onClick={() => setPay(true)} disabled={!cart.length}
+            className={'flex-1 py-3.5 rounded-2xl font-extrabold text-white text-lg ' + (cart.length ? 'bg-rose-400 hover:bg-rose-500' : 'bg-stone-200')}>
+            お会計へ 💴
+          </button>
+        </div>
+        {bookingId && bookingPushed && s.settings.linkSaloneko &&
+          <div className="text-[11px] text-amber-600 bg-amber-50 rounded-xl px-3 py-2 mt-2">この予約は来店連携済み。会計完了時に正しい金額へ自動調整します（二重計上なし）。</div>}
+      </div>
+
+      {pay && <PaymentModal total={total} onDone={complete} onClose={() => setPay(false)} />}
+    </div>
+  );
+}
+
+/* ============================================================
+   レジ締め（日次集計）
+   ============================================================ */
+function CloseRegister({ s, setS, date }) {
+  const [viewSale, setViewSale] = useState(null);
+  const daySales = (s.sales || []).filter((x) => x.date === date && !x.void);
+  const total = daySales.reduce((a, x) => a + x.total, 0);
+  const byMethod = {};
+  PAYMENTS.forEach((p) => (byMethod[p.id] = 0));
+  daySales.forEach((x) => { byMethod[x.method] = (byMethod[x.method] || 0) + x.total; });
+  const cashSales = byMethod.cash || 0;
+
+  const voidSale = (sale) => {
+    if (!confirm('この会計を取り消します。よろしいですか？（売上連携も戻します）')) return;
+    if (s.settings.linkSaloneko && salonekoAvailable()) adjustSaloneko(sale.date, -sale.total, -1);
+    setS({ ...s, sales: s.sales.map((x) => x.id === sale.id ? { ...x, void: true } : x) });
+    setViewSale(null);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="bg-white rounded-3xl shadow-soft p-4"><div className="text-xs text-stone-400 font-bold">会計件数</div><div className="text-2xl font-extrabold text-stone-700 tabnum">{daySales.length}<span className="text-sm">件</span></div></div>
+        <div className="bg-white rounded-3xl shadow-soft p-4 col-span-2"><div className="text-xs text-stone-400 font-bold">本日の売上合計</div><div className="text-3xl font-extrabold text-rose-500 tabnum">{yen(total)}</div></div>
+        <div className="bg-white rounded-3xl shadow-soft p-4"><div className="text-xs text-stone-400 font-bold">客単価</div><div className="text-2xl font-extrabold text-stone-700 tabnum">{daySales.length ? yen(Math.round(total / daySales.length)) : '—'}</div></div>
+      </div>
+
+      <div className="bg-white rounded-3xl shadow-soft p-4">
+        <h3 className="font-bold text-stone-600 mb-3">支払い方法べつ</h3>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {PAYMENTS.map((p) => (
+            <div key={p.id} className="bg-stone-50 rounded-2xl p-3">
+              <div className="text-xs text-stone-400">{p.icon} {p.label}</div>
+              <div className="tabnum font-extrabold text-stone-700">{yen(byMethod[p.id] || 0)}</div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 bg-peach rounded-2xl p-3 text-sm flex justify-between items-center">
+          <span className="text-stone-500 font-bold">現金売上（レジに増えた現金の目安）</span>
+          <span className="tabnum font-extrabold text-rose-500 text-lg">{yen(cashSales)}</span>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-3xl shadow-soft p-4">
+        <h3 className="font-bold text-stone-600 mb-2">本日の会計一覧</h3>
+        {daySales.length === 0 ? <div className="text-center text-stone-300 py-8 text-sm">まだ会計がありません</div> : (
+          <div className="space-y-1.5">
+            {daySales.map((x) => (
+              <button key={x.id} onClick={() => setViewSale(x)} className="w-full flex items-center gap-3 py-2 px-2 rounded-xl hover:bg-stone-50 text-left border-b border-stone-100">
+                <span className="tabnum text-stone-400 w-12">{x.time}</span>
+                <span className="flex-1 min-w-0 truncate font-bold text-stone-700">{x.customerName || '（名前なし）'} <span className="text-xs text-stone-400 font-normal">{x.items.map((i) => i.name).join('・')}</span></span>
+                <span className="text-xs bg-stone-100 rounded-full px-2 py-0.5 text-stone-500">{payLabel(x.method)}</span>
+                <span className="tabnum font-extrabold text-stone-700 w-20 text-right">{yen(x.total)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {viewSale && (
+        <Modal onClose={() => setViewSale(null)}>
+          <div className="p-5">
+            <h3 className="font-extrabold text-stone-700 mb-2">{viewSale.time} の会計</h3>
+            <div className="space-y-1 text-sm">
+              {viewSale.items.map((it, i) => <div key={i} className="flex justify-between"><span>{it.name} ×{it.qty}</span><span className="tabnum">{yen(it.price * it.qty)}</span></div>)}
+              {viewSale.discount > 0 && <div className="flex justify-between text-rose-400"><span>値引き</span><span className="tabnum">-{yen(viewSale.discount)}</span></div>}
+              <div className="flex justify-between font-bold border-t border-stone-100 pt-1"><span>合計（{payLabel(viewSale.method)}）</span><span className="tabnum">{yen(viewSale.total)}</span></div>
+            </div>
+            <div className="mt-4 flex gap-2">
+              <button onClick={() => voidSale(viewSale)} className="px-4 py-3 rounded-2xl bg-stone-100 text-rose-400 font-bold">会計を取り消す</button>
+              <button onClick={() => setViewSale(null)} className="flex-1 py-3 rounded-2xl bg-rose-400 text-white font-extrabold">閉じる</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   設定
+   ============================================================ */
+function Settings({ s, setS, onClose }) {
+  const up = (patch) => setS({ ...s, settings: { ...s.settings, ...patch } });
+  const setProducts = (products) => setS({ ...s, products });
+  return (
+    <Modal onClose={onClose} wide>
+      <div className="p-5 space-y-5">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-extrabold text-stone-700">設定</h3>
+          <button onClick={onClose} className="px-4 py-2 rounded-xl bg-stone-100 text-stone-500 font-bold text-sm">閉じる</button>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <label className="block"><span className="text-xs text-stone-400 font-bold">店名（レシート表示）</span>
+            <input value={s.settings.storeName} onChange={(e) => up({ storeName: e.target.value })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base" /></label>
+          <label className="block"><span className="text-xs text-stone-400 font-bold">消費税率</span>
+            <select value={s.settings.taxRate} onChange={(e) => up({ taxRate: parseFloat(e.target.value) })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5">
+              {[0.10, 0.08, 0].map((v) => <option key={v} value={v}>{Math.round(v * 100)}%（税込価格）</option>)}</select></label>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="font-bold text-stone-600">店販・物販の商品</h4>
+            <button onClick={() => setProducts([...(s.products || []), { id: uid('p'), name: '', price: 0 }])} className="bg-emerald-400 text-white px-3 py-1.5 rounded-full text-sm font-bold">＋ 追加</button>
+          </div>
+          <div className="space-y-2">
+            {(s.products || []).map((p) => (
+              <div key={p.id} className="flex items-center gap-2">
+                <input value={p.name} onChange={(e) => setProducts(s.products.map((x) => x.id === p.id ? { ...x, name: e.target.value } : x))} placeholder="商品名"
+                  className="flex-1 min-w-0 border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2 text-sm" />
+                <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden shrink-0">
+                  <span className="pl-2 text-stone-300 text-sm">¥</span>
+                  <input type="number" value={p.price} step={100} onChange={(e) => setProducts(s.products.map((x) => x.id === p.id ? { ...x, price: parseInt(e.target.value, 10) || 0 } : x))}
+                    className="w-24 px-1 py-2 text-sm text-right tabnum bg-transparent outline-none" />
+                </div>
+                <button onClick={() => setProducts(s.products.filter((x) => x.id !== p.id))} className="w-9 h-9 rounded-xl bg-stone-50 text-rose-300 shrink-0">✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-peach rounded-2xl p-4">
+          <label className="flex items-center gap-3">
+            <input type="checkbox" checked={s.settings.linkSaloneko} onChange={(e) => up({ linkSaloneko: e.target.checked })} className="w-5 h-5 accent-rose-400" />
+            <div>
+              <div className="font-bold text-stone-700">サロねこ本体・予約台帳と連携する</div>
+              <div className="text-xs text-stone-500">会計完了でサロねこの売上へ反映＆予約を会計済みに。{salonekoAvailable() ? 'サロねこ検出' : '同じ場所でサロねこを開くと有効'}／{yoyakuAvailable() ? '予約台帳検出' : '予約台帳は未検出'}</div>
+            </div>
+          </label>
+        </div>
+        <p className="text-xs text-stone-400">※会計データはこの端末内のみに保存されます。サロねこ／予約台帳と同じURLの並び（同一サイト）に置くと連携が有効になります。</p>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   メインApp
+   ============================================================ */
+function App() {
+  const [s, setS] = useState(() => {
+    try { const saved = localStorage.getItem(REZI_KEY); if (saved) return { ...DEFAULT_STATE, ...JSON.parse(saved) }; } catch (e) {}
+    return DEFAULT_STATE;
+  });
+  const [tab, setTab] = useState('register'); // register | close
+  const [showSettings, setShowSettings] = useState(false);
+  const [receipt, setReceipt] = useState(null);
+  useEffect(() => { try { localStorage.setItem(REZI_KEY, JSON.stringify(s)); } catch (e) {} }, [s]);
+
+  return (
+    <div className="min-h-screen pb-10">
+      <header className="bg-gradient-to-br from-rose-300 via-rose-200 to-amber-200 text-stone-700 sticky top-0 z-30 shadow-soft">
+        <div className="max-w-[1200px] mx-auto px-3 py-2.5 flex items-center gap-3">
+          <h1 className="text-lg font-extrabold shrink-0">💴 {s.settings.storeName}</h1>
+          <span className="text-sm font-bold tabnum bg-white/60 rounded-full px-3 h-8 flex items-center">{fmtDate(todayStr())}</span>
+          <div className="flex-1" />
+          <div className="flex bg-white/50 rounded-full p-0.5">
+            <button onClick={() => setTab('register')} className={'px-4 h-8 rounded-full text-sm font-bold ' + (tab === 'register' ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-500')}>会計</button>
+            <button onClick={() => setTab('close')} className={'px-4 h-8 rounded-full text-sm font-bold ' + (tab === 'close' ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-500')}>レジ締め</button>
+          </div>
+          <button onClick={() => setShowSettings(true)} className="w-9 h-9 rounded-full bg-white/70 font-bold">⚙️</button>
+        </div>
+      </header>
+
+      <main className="max-w-[1200px] mx-auto px-3 pt-3 fadein">
+        {tab === 'register'
+          ? <Register s={s} setS={setS} onSold={(sale) => setReceipt(sale)} />
+          : <CloseRegister s={s} setS={setS} date={todayStr()} />}
+      </main>
+
+      {showSettings && <Settings s={s} setS={setS} onClose={() => setShowSettings(false)} />}
+      {receipt && <Receipt sale={receipt} storeName={s.settings.storeName} taxRate={s.settings.taxRate} onClose={() => setReceipt(null)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
