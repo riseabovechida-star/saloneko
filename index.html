@@ -726,6 +726,87 @@ function buildStatements(s) {
 }
 
 /* ============================================================
+   ★ 帳簿の生成（Phase 1・設計書§7）— 仕訳帳・総勘定元帳・試算表
+   buildJournal の仕訳から導出。65万円控除の帳簿一式
+   ============================================================ */
+// 日付順に並べた仕訳（同日は伝票IDで安定ソート）
+function sortedEntries(j) {
+  return [...j.entries].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+}
+
+// 仕訳帳のCSV行（複合仕訳は「諸口」方式＝簿記の標準）
+function journalCsvRows(j) {
+  const rows = [['日付', '伝票', '借方科目', '借方金額', '貸方科目', '貸方金額', '摘要']];
+  sortedEntries(j).forEach((e) => {
+    if (e.debit.length === 1 && e.credit.length === 1) {
+      rows.push([e.date, e.id, e.debit[0].account, e.debit[0].amount, e.credit[0].account, e.credit[0].amount, e.memo]);
+    } else {
+      e.debit.forEach((d) => rows.push([e.date, e.id, d.account, d.amount, '諸口', '', e.memo]));
+      e.credit.forEach((cr) => rows.push([e.date, e.id, '諸口', '', cr.account, cr.amount, e.memo]));
+    }
+  });
+  return rows;
+}
+
+// 勘定科目の表示順（BS→売上→経費は決算書順、その他は登場順）
+function accountOrder(j) {
+  const preferred = [ACCOUNTS.cash, ACCOUNTS.fixedAsset, ACCOUNTS.loan, ACCOUNTS.capital, ACCOUNTS.sales,
+    ...TAX_FORM_MAP.map((x) => x.field), '仕入（材料費）', '給料賃金', '法定福利費', 'その他固定費', '役員報酬'];
+  const seen = new Set();
+  const all = [];
+  sortedEntries(j).forEach((e) => [...e.debit, ...e.credit].forEach((x) => { if (!seen.has(x.account)) { seen.add(x.account); all.push(x.account); } }));
+  const inPreferred = preferred.filter((a) => seen.has(a));
+  const rest = all.filter((a) => !preferred.includes(a));
+  return [...new Set([...inPreferred, ...rest])];
+}
+
+// 総勘定元帳：科目ごとに日付順の明細＋残高（残高＝借方−貸方の累計）
+function ledgerByAccount(j) {
+  const ledger = {};
+  sortedEntries(j).forEach((e) => {
+    const counterOf = (side) => (side === 'D'
+      ? (e.credit.length === 1 ? e.credit[0].account : '諸口')
+      : (e.debit.length === 1 ? e.debit[0].account : '諸口'));
+    e.debit.forEach((x) => {
+      (ledger[x.account] = ledger[x.account] || []).push({ date: e.date, counter: counterOf('D'), debit: x.amount, credit: 0, memo: e.memo });
+    });
+    e.credit.forEach((x) => {
+      (ledger[x.account] = ledger[x.account] || []).push({ date: e.date, counter: counterOf('C'), debit: 0, credit: x.amount, memo: e.memo });
+    });
+  });
+  Object.keys(ledger).forEach((acc) => {
+    let bal = 0;
+    ledger[acc].forEach((r) => { bal += r.debit - r.credit; r.balance = bal; });
+  });
+  return ledger;
+}
+
+function ledgerCsvRows(j) {
+  const ledger = ledgerByAccount(j);
+  const rows = [['科目', '日付', '相手科目', '摘要', '借方', '貸方', '残高（借方−貸方）']];
+  accountOrder(j).forEach((acc) => {
+    (ledger[acc] || []).forEach((r) => rows.push([acc, r.date, r.counter, r.memo, r.debit || '', r.credit || '', r.balance]));
+  });
+  return rows;
+}
+
+// 試算表：科目別の借方計・貸方計・残高。合計の借貸一致が帳簿の健全性チェック
+function trialBalance(j) {
+  const sums = {};
+  j.entries.forEach((e) => {
+    e.debit.forEach((x) => { (sums[x.account] = sums[x.account] || { debit: 0, credit: 0 }).debit += x.amount; });
+    e.credit.forEach((x) => { (sums[x.account] = sums[x.account] || { debit: 0, credit: 0 }).credit += x.amount; });
+  });
+  const rows = accountOrder(j).map((acc) => {
+    const v = sums[acc] || { debit: 0, credit: 0 };
+    return { account: acc, debit: v.debit, credit: v.credit, balance: v.debit - v.credit };
+  });
+  const totalDebit = rows.reduce((a, r) => a + r.debit, 0);
+  const totalCredit = rows.reduce((a, r) => a + r.credit, 0);
+  return { rows, totalDebit, totalCredit, balanced: totalDebit === totalCredit };
+}
+
+/* ============================================================
    ★ 業種テンプレ（横展開）— 用語・目安・職種・設備を出し分け
    選ぶと materialCostRate 等の目安が入る。あとから自由に直せる
    ============================================================ */
@@ -3511,6 +3592,55 @@ function BSCard({ s, setS, m }) {
   );
 }
 
+/* 📚 帳簿を出す（65万円控除用）— 仕訳帳・総勘定元帳・試算表（Phase 1） */
+function LedgerCard({ s }) {
+  const [printView, setPrintView] = useState(null);
+  const j = useMemo(() => buildJournal(s), [s]);
+  const tb = useMemo(() => trialBalance(j), [j]);
+  const errors = j.issues.filter((i) => i.level === 'error');
+  const warns = j.issues.filter((i) => i.level === 'warn');
+  const csvOf = (rows, name) => saveCSV(name, '﻿' + rows.map((r) => r.join(',')).join('\n'));
+
+  const printTrial = () => {
+    const yenC = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+    let rows = '';
+    tb.rows.forEach((r) => {
+      rows += `<tr><td>${r.account}</td><td class="num">${r.debit ? yenC(r.debit) : ''}</td><td class="num">${r.credit ? yenC(r.credit) : ''}</td><td class="num">${yenC(r.balance)}</td></tr>`;
+    });
+    rows += `<tr class="total"><td>合計</td><td class="num">${yenC(tb.totalDebit)}</td><td class="num">${yenC(tb.totalCredit)}</td><td class="num">${tb.balanced ? '一致 ✓' : '不一致 ⚠️'}</td></tr>`;
+    const body = `<h1>試算表（${j.year}年）</h1>
+      <div class="sub">サロねこ ／ 毎日入力・レシート・お店の費用からの自動仕訳・概算</div>
+      <table><thead><tr class="head"><td>科目</td><td class="num">借方計</td><td class="num">貸方計</td><td class="num">残高（借−貸）</td></tr></thead><tbody>${rows}</tbody></table>
+      <div class="note">※定期費用（家賃・給与等）は記録のある月の月末・家事按分後で自動計上。期首残高・借入の増減・減価償却も自動仕訳です。<br>※概算の下ごしらえです。申告・提出前に税理士にご確認ください。</div>`;
+    setPrintView(body);
+  };
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <h3 className="font-bold text-stone-600">📚 帳簿を出す（65万円控除用）</h3>
+        <span className={'text-[10px] font-bold rounded-full px-2.5 py-1 border ' + (tb.balanced && errors.length === 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : 'bg-amber-50 text-amber-600 border-amber-200')}>
+          {tb.balanced && errors.length === 0 ? '✓ 帳簿バランスOK' : '⚠️ 要確認'}
+        </span>
+      </div>
+      <p className="text-sm text-stone-400 mb-3">むずかしい帳簿（仕訳帳・総勘定元帳・試算表）は、毎日の入力からこっちで用意しておいたよ。{j.year}年・仕訳 {j.entries.length}本。</p>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <button onClick={() => csvOf(journalCsvRows(j), `仕訳帳_${j.year}.csv`)} className="bg-emerald-400 hover:bg-emerald-500 text-white py-3 rounded-2xl font-bold text-sm">📄 仕訳帳CSV</button>
+        <button onClick={() => csvOf(ledgerCsvRows(j), `総勘定元帳_${j.year}.csv`)} className="bg-emerald-400 hover:bg-emerald-500 text-white py-3 rounded-2xl font-bold text-sm">📄 総勘定元帳CSV</button>
+        <button onClick={() => csvOf([['科目', '借方計', '貸方計', '残高（借−貸）'], ...tb.rows.map((r) => [r.account, r.debit, r.credit, r.balance]), ['合計', tb.totalDebit, tb.totalCredit, '']], `試算表_${j.year}.csv`)} className="bg-emerald-400 hover:bg-emerald-500 text-white py-3 rounded-2xl font-bold text-sm">📄 試算表CSV</button>
+        <button onClick={printTrial} className="bg-stone-600 hover:bg-stone-700 text-white py-3 rounded-2xl font-bold text-sm">🖨️ 試算表を画像/印刷</button>
+      </div>
+      {(errors.length > 0 || warns.length > 0) && (
+        <div className="mt-3 bg-amber-50 text-amber-700 rounded-2xl p-3 text-xs space-y-0.5">
+          {[...errors, ...warns].map((w) => <div key={w.code + w.message}>・{w.message}</div>)}
+        </div>
+      )}
+      <p className="text-xs text-stone-400 mt-3">※家賃・給与などの定期費用は「記録のある月」の月末日付で自動仕訳しています。同じ費用をレシートでも登録すると二重になるので注意してね。期首の残高は下の貸借対照表カード（または借入れタブ）で直せます。</p>
+      {printView && <PrintOverlay html={printView} filename={`試算表_${j.year}`} onClose={() => setPrintView(null)} />}
+    </Card>
+  );
+}
+
 // 印刷プレビュー：画面内に全画面オーバーレイで表示。スマホは画像で保存・共有（iOS/アプリ内ブラウザ対応）、PCは印刷
 function PrintOverlay({ html, filename, onClose }) {
   const sheetRef = useRef(null);
@@ -3702,6 +3832,8 @@ function TaxTab({ s, setS, m }) {
       {m.isSole && <TranscriptCard m={m} g={g} transcript={transcript} incomeBeforeBlue={incomeBeforeBlue} blue={blue} incomeAfterBlue={incomeAfterBlue} />}
 
       {m.isSole && blue >= 550000 && <BSCard s={s} setS={setS} m={m} />}
+
+      <LedgerCard s={s} />
 
       <Card className="p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
