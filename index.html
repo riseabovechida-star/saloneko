@@ -2465,22 +2465,27 @@ function LivingTab({ s, setS, m }) {
           <h3 className="font-bold text-stone-600">毎月の生活費</h3>
           <button onClick={add} className="bg-emerald-400 text-white px-3 py-1.5 rounded-full text-sm font-bold">＋ 費目を追加</button>
         </div>
-        <div className="space-y-2">
+        <div className="space-y-2.5">
           {items.map((x) => (
-            <div key={x.id} className="flex items-center gap-2">
-              <input value={x.label} onChange={(e) => upd(x.id, { label: e.target.value })}
-                className="border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2 text-sm flex-1 min-w-0" />
-              <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden shrink-0">
-                <NumInput value={x.amount} onChange={(v) => upd(x.id, { amount: v })}
-                  className="w-24 min-w-0 px-2 py-2 text-sm text-right tabnum bg-transparent outline-none" />
-                <span className="px-2 text-xs text-stone-400">円</span>
+            <div key={x.id} className="border border-stone-100 rounded-2xl p-3 space-y-2 bg-white">
+              {/* 費目名 ＋ 削除（スマホ縦画面：1行目） */}
+              <div className="flex items-center gap-2">
+                <input value={x.label} onChange={(e) => upd(x.id, { label: e.target.value })} placeholder="費目"
+                  className="border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base flex-1 min-w-0" />
+                <button onClick={() => del(x.id)} className="w-10 h-10 rounded-xl bg-stone-50 text-rose-300 hover:text-rose-500 text-lg shrink-0">✕</button>
               </div>
-              <button onClick={() => del(x.id)} className="text-rose-300 hover:text-rose-500 px-1 shrink-0">✕</button>
+              {/* 金額（2行目・全幅） */}
+              <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden">
+                <span className="pl-3 text-stone-300 font-bold shrink-0">¥</span>
+                <NumInput value={x.amount} onChange={(v) => upd(x.id, { amount: v })}
+                  className="w-full min-w-0 px-2 py-2.5 text-right tabnum text-lg font-bold bg-transparent outline-none" />
+                <span className="pr-3 pl-1 text-xs text-stone-300 tabnum shrink-0">{man(x.amount)}</span>
+              </div>
             </div>
           ))}
         </div>
-        <div className="mt-4 bg-blush rounded-2xl p-4 flex justify-between items-center">
-          <span className="font-bold text-stone-600">毎月の生活費 合計</span>
+        <div className="mt-4 bg-blush rounded-2xl p-4 flex flex-wrap justify-between items-baseline gap-x-3 gap-y-1">
+          <span className="font-bold text-stone-600 shrink-0">毎月の生活費 合計</span>
           <span className="text-2xl font-extrabold text-rose-400 tabnum">{man(m.livingMonthly)}</span>
         </div>
       </Card>
