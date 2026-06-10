@@ -509,6 +509,135 @@ function compute(s) {
 }
 
 /* ============================================================
+   ★ 仕訳導出エンジン（本格会計版 Phase 0・設計書§4-6）
+   ──────────────────────────────────────────────
+   ・仕訳は保存しない。state から毎回「導出」する（compute と同じ純関数）
+   ・UIからはまだ使わない。確認は console で window.__journal()
+   ・税込経理／個人=暦年（settings.taxYear の1年分の帳簿）
+   ・科目は EXPENSE_CATEGORIES / TAX_FORM_MAP の文字列をそのまま使う（発明しない）
+   ============================================================ */
+const ACCOUNTS = {
+  cash: '現金預金',        // Phase 0 は現金とカードを分けず1本（設計書§5）
+  fixedAsset: '工具器具備品',
+  loan: '借入金',
+  capital: '元入金',
+  sales: '売上高',
+};
+
+function buildJournal(s) {
+  const issues = [];
+  const entries = [];
+  const year = s.settings.taxYear || new Date().getFullYear();
+  const yearStr = String(year);
+  const c = s.current;
+  const isSole = s.settings.businessType === '個人事業主';
+  const grossOf = (d) => ((d.gross != null ? d.gross : d.amount) || 0); // 旧データ(amount)互換
+  const r0 = (n) => Math.round(n || 0);
+  const sum = (xs) => xs.reduce((a, x) => a + x.amount, 0);
+
+  // 仕訳を1本登録（借貸一致をその場で検証＝設計書§6 検証①）
+  const push = (id, date, debit, credit, source, memo) => {
+    if (sum(debit) !== sum(credit)) {
+      issues.push({ level: 'error', code: 'unbalanced', message: `${id}: 借方${sum(debit)} ≠ 貸方${sum(credit)}` });
+    }
+    entries.push({ id, date, debit, credit, source, memo });
+  };
+
+  /* J1 毎日入力 → 売上仕訳（税込経理＝1本） */
+  const yearDaily = (c.dailySales || []).filter((d) => d.date && d.date.slice(0, 4) === yearStr && grossOf(d) > 0);
+  yearDaily.forEach((d) => {
+    const g = r0(grossOf(d));
+    push(`daily-${d.date}`, d.date,
+      [{ account: ACCOUNTS.cash, amount: g }],
+      [{ account: ACCOUNTS.sales, amount: g }],
+      { type: 'daily', refId: d.date }, `${d.date} 売上`);
+  });
+
+  /* J2 レシート・請求書 → 経費仕訳（支払済み扱い） */
+  const allReceipts = s.receipts || [];
+  const yearReceipts = allReceipts.filter((r) => r.date && r.date.slice(0, 4) === yearStr && (r.amount || 0) > 0);
+  yearReceipts.forEach((r) => {
+    const a = r0(r.amount);
+    push(`receipt-${r.id}`, r.date,
+      [{ account: r.category || '雑費', amount: a }],
+      [{ account: ACCOUNTS.cash, amount: a }],
+      { type: 'receipt', refId: String(r.id) }, r.vendor || 'レシート');
+  });
+  const dateless = allReceipts.filter((r) => !r.date && (r.amount || 0) > 0).length;
+  if (dateless > 0) issues.push({ level: 'warn', code: 'receipt-no-date', message: `日付のないレシートが${dateless}件あり、帳簿に入っていません` });
+
+  /* J3 月次固定費（データのある月の月末・家事按分後）※レシートとの二重計上は申告画面と同じ注意書き方針 */
+  const staffSalary = (c.staff || []).reduce((a, p) => a + (p.monthlySalary || 0), 0);
+  const months = [...new Set(yearDaily.map((d) => d.date.slice(0, 7)))].sort();
+  months.forEach((ymKey) => {
+    const [yy, mm] = ymKey.split('-').map(Number);
+    const lastDay = new Date(yy, mm, 0).getDate();
+    const lines = [
+      { account: '地代家賃', amount: r0(c.rent * (c.rentBizRate ?? 1)) },
+      { account: '水道光熱費', amount: r0(c.utilities * (c.utilitiesBizRate ?? 1)) },
+      { account: 'その他固定費', amount: r0(c.otherFixed) },
+      { account: '給料賃金', amount: r0(staffSalary) },
+      { account: '法定福利費', amount: r0(staffSalary * (c.socialInsuranceRate || 0)) },
+    ];
+    if (!isSole) lines.push({ account: '役員報酬', amount: r0(c.ownerSalary) });
+    const debit = lines.filter((x) => x.amount > 0);
+    if (!debit.length) return;
+    push(`fixed-${ymKey}`, `${ymKey}-${String(lastDay).padStart(2, '0')}`,
+      debit, [{ account: ACCOUNTS.cash, amount: sum(debit) }],
+      { type: 'monthly-fixed', refId: ymKey }, `${mm}月分 固定費`);
+  });
+
+  /* J4 減価償却（12/31・年1本/資産・直接法） */
+  (c.assets || []).forEach((a) => {
+    const dep = depreciate(a, year);
+    if (dep.thisYear > 0) {
+      push(`dep-${a.id}-${year}`, `${year}-12-31`,
+        [{ account: '減価償却費', amount: r0(dep.thisYear) }],
+        [{ account: ACCOUNTS.fixedAsset, amount: r0(dep.thisYear) }],
+        { type: 'depreciation', refId: String(a.id) }, `${a.label || '固定資産'} 減価償却`);
+    }
+  });
+
+  /* J5 期首残高（1/1・元入金は差額＝BSCardと同式） */
+  const openCash = r0(s.settings.bsOpenCash);
+  const openLoan = r0(s.settings.bsOpenLoan);
+  const fixedBegin = r0((c.assets || []).reduce((a, x) => a + depreciate(x, year).bookBegin, 0));
+  const capital = openCash + fixedBegin - openLoan;
+  if (capital < 0) issues.push({ level: 'warn', code: 'negative-capital', message: '期首の元入金がマイナス（負債が資産を上回っています）' });
+  const debit5 = [], credit5 = [];
+  if (openCash > 0) debit5.push({ account: ACCOUNTS.cash, amount: openCash });
+  if (fixedBegin > 0) debit5.push({ account: ACCOUNTS.fixedAsset, amount: fixedBegin });
+  if (openLoan > 0) credit5.push({ account: ACCOUNTS.loan, amount: openLoan });
+  if (capital !== 0) (capital > 0 ? credit5 : debit5).push({ account: ACCOUNTS.capital, amount: Math.abs(capital) });
+  if (debit5.length || credit5.length) {
+    push(`open-${year}`, `${year}-01-01`, debit5, credit5, { type: 'opening', refId: yearStr }, '期首残高');
+  }
+
+  /* J6 事業主貸（生活費引き出し）は Phase 0 では生成しない（設計書§6） */
+
+  /* ---- 自己検証（設計書§6 ②③＋総借貸一致） ---- */
+  const totalDebit = entries.reduce((a, e) => a + sum(e.debit), 0);
+  const totalCredit = entries.reduce((a, e) => a + sum(e.credit), 0);
+  if (totalDebit !== totalCredit) {
+    issues.push({ level: 'error', code: 'trial-unbalanced', message: `試算表が不一致：借方計${totalDebit} ≠ 貸方計${totalCredit}` });
+  }
+  // ② 売上：仕訳の売上高 ＝ 毎日入力（対象年・日次で丸め）の合計
+  const journalSales = entries.reduce((a, e) => a + e.credit.filter((x) => x.account === ACCOUNTS.sales).reduce((b, x) => b + x.amount, 0), 0);
+  const expectedSales = yearDaily.reduce((a, d) => a + r0(grossOf(d)), 0);
+  if (journalSales !== expectedSales) {
+    issues.push({ level: 'error', code: 'sales-mismatch', message: `売上が毎日入力と不一致：仕訳${journalSales} ≠ 入力${expectedSales}` });
+  }
+  // ③ レシート：仕訳のレシート由来 ＝ レシート登録（対象年）の合計
+  const journalReceipts = entries.filter((e) => e.source.type === 'receipt').reduce((a, e) => a + sum(e.debit), 0);
+  const expectedReceipts = yearReceipts.reduce((a, r) => a + r0(r.amount), 0);
+  if (journalReceipts !== expectedReceipts) {
+    issues.push({ level: 'error', code: 'receipt-mismatch', message: `経費がレシート登録と不一致：仕訳${journalReceipts} ≠ 登録${expectedReceipts}` });
+  }
+
+  return { year, entries, issues, totals: { debit: totalDebit, credit: totalCredit } };
+}
+
+/* ============================================================
    ★ 業種テンプレ（横展開）— 用語・目安・職種・設備を出し分け
    選ぶと materialCostRate 等の目安が入る。あとから自由に直せる
    ============================================================ */
@@ -3714,6 +3843,8 @@ function App() {
 
   useEffect(() => {
     try { localStorage.setItem('salon-finance-v1', JSON.stringify(s)); } catch (e) {}
+    // 開発用：console から仕訳を確認できる（Phase 0・呼んだ時だけ計算するので無害）
+    try { window.__journal = () => buildJournal(s); } catch (e) {}
   }, [s]);
 
   const reset = () => {
