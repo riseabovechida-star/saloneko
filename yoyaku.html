@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<title>サロねこ予約 — タブレット予約台帳</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = { theme: { extend: {
+    fontFamily: { sans: ['"M PLUS Rounded 1c"', 'sans-serif'] },
+    colors: { cream: '#fbf7f3', peach: '#fff1ea', blush: '#ffe4e0' },
+    boxShadow: { soft: '0 6px 24px -8px rgba(180,140,120,0.25)' },
+  } } };
+</script>
+<style>
+  body { font-family: "M PLUS Rounded 1c", -apple-system, "Hiragino Maru Gothic ProN", sans-serif; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+  .tabnum { font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { height: 10px; width: 10px; }
+  ::-webkit-scrollbar-thumb { background: #e7d8cf; border-radius: 99px; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  .fadein { animation: fadein .25s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .popin { animation: popin .3s cubic-bezier(.2,1.3,.4,1); }
+  @keyframes popin { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: none; } }
+  /* キャンセルの斜線パターン */
+  .stripe { background-image: repeating-linear-gradient(45deg, rgba(120,113,108,.12) 0 6px, transparent 6px 12px); }
+  select, input { font-family: inherit; }
+</style>
+</head>
+<body class="bg-cream text-stone-700">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ============================================================
+   サロねこ予約 — タブレット予約台帳（横軸＝時間／縦軸＝担当者）
+   ・単一HTML（サロねこ本体とは別アプリ）。localStorageに保存
+   ・同一オリジン（同じGitHub Pages）に置くと、来店処理で
+     サロねこ本体（salon-finance-v1）の「毎日入力」へ売上を自動連携
+   ============================================================ */
+const STORE_KEY = 'saloneko-yoyaku-v1';
+const SALONEKO_KEY = 'salon-finance-v1';
+
+const yen = (n) => '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+const pad2 = (n) => String(n).padStart(2, '0');
+const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const toMin = (hhmm) => { const [h, m] = (hhmm || '0:0').split(':').map(Number); return h * 60 + m; };
+const toHHMM = (min) => `${pad2(Math.floor(min / 60))}:${pad2(min % 60)}`;
+const WD = ['日', '月', '火', '水', '木', '金', '土'];
+const fmtDate = (ds) => { const [y, m, d] = ds.split('-').map(Number); const wd = new Date(y, m - 1, d).getDay(); return `${m}月${d}日(${WD[wd]})`; };
+const shiftDate = (ds, days) => { const [y, m, d] = ds.split('-').map(Number); const dt = new Date(y, m - 1, d + days); return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`; };
+const uid = (p) => p + Math.random().toString(36).slice(2, 9);
+
+const STAFF_COLORS = ['#fb7185', '#60a5fa', '#34d399', '#fbbf24', '#a78bfa', '#f472b6', '#22d3ee', '#fb923c'];
+
+const STATUS = {
+  booked: { label: '予約', chip: 'bg-rose-100 text-rose-500', dot: '#fb7185' },
+  done:   { label: '来店済', chip: 'bg-emerald-100 text-emerald-600', dot: '#34d399' },
+  cancel: { label: 'キャンセル', chip: 'bg-stone-200 text-stone-500', dot: '#a8a29e' },
+  noshow: { label: '無断', chip: 'bg-amber-100 text-amber-600', dot: '#fbbf24' },
+};
+
+const DEFAULT_STATE = {
+  settings: { businessName: 'サロねこ予約', openHour: 9, closeHour: 20, slotMin: 30, pxPerMin: 2.6, linkSaloneko: true },
+  staff: [{ id: 's1', name: '自分', color: STAFF_COLORS[0] }],
+  menus: [
+    { id: 'm1', name: 'カット', durationMin: 60, price: 4500 },
+    { id: 'm2', name: 'カラー', durationMin: 90, price: 8000 },
+    { id: 'm3', name: 'パーマ', durationMin: 120, price: 11000 },
+    { id: 'm4', name: 'カット+カラー', durationMin: 150, price: 12000 },
+    { id: 'm5', name: 'トリートメント', durationMin: 30, price: 3000 },
+  ],
+  bookings: [], // { id,date,staffId,start'HH:mm',durationMin,name,phone,menu,price,status,memo,pushed }
+};
+
+/* ---- サロねこ本体への売上連携（同一オリジンのlocalStorage） ---- */
+function salonekoAvailable() {
+  try { return localStorage.getItem(SALONEKO_KEY) != null; } catch (e) { return false; }
+}
+// 来店確定 → サロねこの dailySales にその日の売上・客数を加算（二重防止つき）
+function pushSaleToSaloneko(b, sign) {
+  try {
+    const raw = localStorage.getItem(SALONEKO_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (!s.current) return false;
+    const list = s.current.dailySales || [];
+    const idx = list.findIndex((x) => x.date === b.date);
+    const delta = (b.price || 0) * sign;
+    if (idx >= 0) {
+      const cur = list[idx];
+      const g = (cur.gross != null ? cur.gross : cur.amount) || 0;
+      list[idx] = { date: b.date, gross: Math.max(0, g + delta), customers: Math.max(0, (cur.customers || 0) + sign) };
+    } else if (sign > 0) {
+      list.push({ date: b.date, gross: Math.max(0, delta), customers: 1 });
+    }
+    s.current.dailySales = list.sort((a, b2) => a.date.localeCompare(b2.date));
+    localStorage.setItem(SALONEKO_KEY, JSON.stringify(s));
+    return true;
+  } catch (e) { return false; }
+}
+
+/* ============================================================
+   共通UI
+   ============================================================ */
+function Modal({ children, onClose, wide }) {
+  useEffect(() => { document.body.classList.add('overflow-hidden'); return () => document.body.classList.remove('overflow-hidden'); }, []);
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-900/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className={'bg-white rounded-3xl shadow-soft w-full ' + (wide ? 'max-w-2xl' : 'max-w-md') + ' max-h-[92vh] overflow-auto popin'} onClick={(e) => e.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   予約の追加・編集モーダル
+   ============================================================ */
+function BookingForm({ s, initial, onSave, onDelete, onClose, setStatus }) {
+  const [f, setF] = useState(() => ({
+    id: initial.id || uid('b'),
+    date: initial.date, staffId: initial.staffId || s.staff[0].id,
+    start: initial.start || '10:00', durationMin: initial.durationMin || 60,
+    name: initial.name || '', phone: initial.phone || '', menu: initial.menu || '',
+    price: initial.price || 0, status: initial.status || 'booked', memo: initial.memo || '',
+    nominated: initial.nominated || false, pushed: initial.pushed || false,
+  }));
+  const isNew = !initial.id;
+  const up = (patch) => setF((x) => ({ ...x, ...patch }));
+  // 過去予約からお名前候補
+  const names = useMemo(() => [...new Set(s.bookings.map((b) => b.name).filter(Boolean))].slice(0, 200), [s.bookings]);
+  const applyMenu = (mn) => up({ menu: mn.name, durationMin: mn.durationMin, price: mn.price });
+  const times = [];
+  for (let t = s.settings.openHour * 60; t <= s.settings.closeHour * 60; t += s.settings.slotMin) times.push(toHHMM(t));
+
+  return (
+    <Modal onClose={onClose}>
+      <div className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-extrabold text-stone-700">{isNew ? '予約を追加' : '予約の詳細'}</h3>
+          <span className={'text-xs font-bold rounded-full px-3 py-1 ' + STATUS[f.status].chip}>{STATUS[f.status].label}</span>
+        </div>
+
+        {/* メニュー プリセット */}
+        <div className="mb-3">
+          <div className="text-xs text-stone-400 font-bold mb-1.5">メニュー（タップで時間・金額が入ります）</div>
+          <div className="flex flex-wrap gap-1.5">
+            {s.menus.map((mn) => (
+              <button key={mn.id} type="button" onClick={() => applyMenu(mn)}
+                className={'text-sm rounded-full px-3 py-1.5 border-2 font-bold transition-colors ' + (f.menu === mn.name ? 'bg-rose-400 text-white border-rose-400' : 'bg-stone-50 text-stone-500 border-stone-200')}>
+                {mn.name} <span className="text-xs opacity-70">{mn.durationMin}分</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 指名 / フリー */}
+        <div className="mb-3 flex items-center gap-2">
+          <span className="text-xs text-stone-400 font-bold">来店区分</span>
+          <button type="button" onClick={() => up({ nominated: true })}
+            className={'px-3 py-1.5 rounded-full text-sm font-bold border-2 ' + (f.nominated ? 'bg-rose-400 text-white border-rose-400' : 'bg-stone-50 text-stone-500 border-stone-200')}>★ 指名</button>
+          <button type="button" onClick={() => up({ nominated: false })}
+            className={'px-3 py-1.5 rounded-full text-sm font-bold border-2 ' + (!f.nominated ? 'bg-sky-400 text-white border-sky-400' : 'bg-stone-50 text-stone-500 border-stone-200')}>フリー</button>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">担当</span>
+            <select value={f.staffId} onChange={(e) => up({ staffId: e.target.value })}
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base">
+              {s.staff.map((st) => <option key={st.id} value={st.id}>{st.name}</option>)}
+            </select>
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">日付</span>
+            <input type="date" value={f.date} onChange={(e) => up({ date: e.target.value })}
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base" />
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">開始</span>
+            <select value={f.start} onChange={(e) => up({ start: e.target.value })}
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base tabnum">
+              {times.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">所要時間</span>
+            <div className="mt-1 flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden">
+              <input type="number" inputMode="numeric" value={f.durationMin} step={15} min={15}
+                onChange={(e) => up({ durationMin: parseInt(e.target.value, 10) || 0 })}
+                className="w-full px-3 py-2.5 text-base text-right tabnum bg-transparent outline-none" />
+              <span className="px-3 text-sm text-stone-400">分</span>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">お名前</span>
+            <input value={f.name} onChange={(e) => up({ name: e.target.value })} list="namelist" placeholder="お客さま名"
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base" />
+            <datalist id="namelist">{names.map((n) => <option key={n} value={n} />)}</datalist>
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">金額（税込）</span>
+            <div className="mt-1 flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden">
+              <span className="pl-3 text-stone-300 font-bold">¥</span>
+              <input type="number" inputMode="numeric" value={f.price || ''} step={500} placeholder="0"
+                onChange={(e) => up({ price: parseInt(e.target.value, 10) || 0 })}
+                className="w-full px-2 py-2.5 text-base text-right tabnum font-bold bg-transparent outline-none" />
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">電話（任意）</span>
+            <input value={f.phone} onChange={(e) => up({ phone: e.target.value })} inputMode="tel" placeholder="090-…"
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base tabnum" />
+          </label>
+          <label className="block">
+            <span className="text-xs text-stone-400 font-bold">メモ（任意）</span>
+            <input value={f.memo} onChange={(e) => up({ memo: e.target.value })} placeholder="メニュー詳細・要望など"
+              className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base" />
+          </label>
+        </div>
+
+        {/* 来店・キャンセルなどの状態ボタン（既存予約のみ） */}
+        {!isNew && (
+          <div className="mt-4">
+            <div className="text-xs text-stone-400 font-bold mb-1.5">状態を変える</div>
+            <div className="grid grid-cols-4 gap-2">
+              <button onClick={() => setStatus(f, 'done')} className="py-2.5 rounded-xl bg-emerald-400 hover:bg-emerald-500 text-white font-bold text-sm">🎉 来店</button>
+              <button onClick={() => setStatus(f, 'booked')} className="py-2.5 rounded-xl bg-rose-100 hover:bg-rose-200 text-rose-500 font-bold text-sm">予約にもどす</button>
+              <button onClick={() => setStatus(f, 'cancel')} className="py-2.5 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-500 font-bold text-sm">キャンセル</button>
+              <button onClick={() => setStatus(f, 'noshow')} className="py-2.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-600 font-bold text-sm">無断キャン</button>
+            </div>
+            {f.status === 'done' && s.settings.linkSaloneko && salonekoAvailable() &&
+              <div className="mt-2 text-xs text-emerald-600 bg-emerald-50 rounded-xl px-3 py-2">✓ 来店にすると、サロねこの「毎日入力」へ {yen(f.price)} ・客数+1 が連携されます</div>}
+          </div>
+        )}
+
+        <div className="mt-5 flex gap-2">
+          {!isNew && <button onClick={() => onDelete(f)} className="px-4 py-3 rounded-2xl bg-stone-100 text-rose-400 font-bold">削除</button>}
+          <button onClick={onClose} className="px-4 py-3 rounded-2xl bg-stone-100 text-stone-500 font-bold">閉じる</button>
+          <button onClick={() => onSave(f)} disabled={!f.name && !f.menu}
+            className={'flex-1 py-3 rounded-2xl font-extrabold text-white ' + ((f.name || f.menu) ? 'bg-rose-400 hover:bg-rose-500' : 'bg-stone-200')}>
+            {isNew ? '追加する' : '保存する'} ✓
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   台帳グリッド（横軸＝時間／縦軸＝担当者）
+   ============================================================ */
+function LedgerGrid({ s, date, onCell, onOpen }) {
+  const { openHour, closeHour, slotMin, pxPerMin } = s.settings;
+  const openMin = openHour * 60, closeMin = closeHour * 60;
+  const totalMin = closeMin - openMin;
+  const gridW = totalMin * pxPerMin;
+  const rowH = 76;
+  const nameW = 96;
+  const laneRefs = useRef({});
+
+  // 時間目盛り（1時間ごと＋スロット罫線）
+  const hours = [];
+  for (let h = openHour; h <= closeHour; h++) hours.push(h);
+  const slotLines = [];
+  for (let t = openMin; t <= closeMin; t += slotMin) slotLines.push(t);
+
+  const dayBookings = s.bookings.filter((b) => b.date === date);
+
+  const tapLane = (staffId, e) => {
+    const lane = laneRefs.current[staffId];
+    if (!lane) return;
+    const rect = lane.getBoundingClientRect();
+    const x = e.clientX - rect.left + lane.scrollLeft; // laneはスクロールしないが念のため
+    let min = openMin + Math.round((x / pxPerMin) / slotMin) * slotMin;
+    min = Math.max(openMin, Math.min(closeMin - slotMin, min));
+    onCell({ date, staffId, start: toHHMM(min) });
+  };
+
+  return (
+    <div className="bg-white rounded-3xl shadow-soft border border-stone-100 overflow-hidden">
+      <div className="overflow-x-auto no-scrollbar">
+        <div style={{ width: nameW + gridW }}>
+          {/* 時間ヘッダー */}
+          <div className="flex sticky top-0 z-20 bg-white border-b border-stone-100">
+            <div style={{ width: nameW }} className="shrink-0 bg-stone-50 border-r border-stone-100" />
+            <div className="relative" style={{ width: gridW, height: 34 }}>
+              {hours.map((h) => (
+                <div key={h} className="absolute top-0 h-full flex items-center" style={{ left: (h * 60 - openMin) * pxPerMin }}>
+                  <span className="text-sm font-bold text-stone-500 tabnum -ml-3">{h}:00</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {/* スタッフ行 */}
+          {s.staff.map((st) => {
+            const rowBookings = dayBookings.filter((b) => b.staffId === st.id);
+            return (
+              <div key={st.id} className="flex border-b border-stone-100 last:border-0">
+                <div style={{ width: nameW }} className="shrink-0 bg-stone-50 border-r border-stone-100 flex items-center gap-1.5 px-2" >
+                  <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: st.color }} />
+                  <span className="text-sm font-bold text-stone-600 truncate">{st.name}</span>
+                </div>
+                <div ref={(el) => (laneRefs.current[st.id] = el)} onClick={(e) => tapLane(st.id, e)}
+                  className="relative cursor-pointer" style={{ width: gridW, height: rowH }}>
+                  {/* スロット罫線 */}
+                  {slotLines.map((t) => (
+                    <div key={t} className="absolute top-0 bottom-0 border-l" style={{ left: (t - openMin) * pxPerMin, borderColor: (t % 60 === 0) ? '#e7e5e4' : '#f5f5f4' }} />
+                  ))}
+                  {/* 予約ブロック */}
+                  {rowBookings.map((b) => {
+                    const left = (toMin(b.start) - openMin) * pxPerMin;
+                    const width = Math.max(b.durationMin * pxPerMin - 3, 28);
+                    const stt = STATUS[b.status] || STATUS.booked;
+                    const isCancel = b.status === 'cancel';
+                    return (
+                      <button key={b.id} onClick={(e) => { e.stopPropagation(); onOpen(b); }}
+                        className={'absolute top-1 rounded-xl px-2 py-1 text-left overflow-hidden shadow-soft border ' + (isCancel ? 'stripe bg-stone-100 border-stone-200' : 'border-white')}
+                        style={{ left, width, height: rowH - 8, background: isCancel ? undefined : stt.dot + '22', borderLeft: `4px solid ${stt.dot}` }}>
+                        <div className={'text-xs font-extrabold truncate ' + (isCancel ? 'text-stone-400 line-through' : 'text-stone-700')}>{b.nominated && <span className="text-rose-400">★</span>}{b.name || '（名前なし）'}</div>
+                        <div className="text-[11px] text-stone-500 truncate">{b.menu}</div>
+                        <div className="text-[11px] tabnum font-bold truncate" style={{ color: stt.dot }}>{b.price ? yen(b.price) : ''} {b.status === 'done' ? '✓' : ''}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="px-3 py-2 text-[11px] text-stone-400 border-t border-stone-100">空いているところをタップ → 予約を追加 ／ 予約ブロックをタップ → 来店・編集</div>
+    </div>
+  );
+}
+
+/* ============================================================
+   リスト表示（時間順）— スマホ・確認向け
+   ============================================================ */
+function AgendaList({ s, date, onOpen }) {
+  const rows = s.bookings.filter((b) => b.date === date).sort((a, b) => toMin(a.start) - toMin(b.start));
+  const staffName = (id) => (s.staff.find((x) => x.id === id) || {}).name || '';
+  if (!rows.length) return <div className="bg-white rounded-3xl shadow-soft p-10 text-center text-stone-400">この日の予約はまだありません</div>;
+  return (
+    <div className="space-y-2">
+      {rows.map((b) => {
+        const stt = STATUS[b.status] || STATUS.booked;
+        return (
+          <button key={b.id} onClick={() => onOpen(b)} className="w-full bg-white rounded-2xl shadow-soft border border-stone-100 p-3 flex items-center gap-3 text-left">
+            <div className="text-center shrink-0 w-14">
+              <div className="text-lg font-extrabold text-stone-700 tabnum">{b.start}</div>
+              <div className="text-[10px] text-stone-400">{b.durationMin}分</div>
+            </div>
+            <div className="w-1 self-stretch rounded-full" style={{ background: stt.dot }} />
+            <div className="flex-1 min-w-0">
+              <div className="font-extrabold text-stone-700 truncate">{b.nominated && <span className="text-rose-400">★</span>}{b.name || '（名前なし）'} <span className="text-xs text-stone-400 font-normal">{staffName(b.staffId)}</span>{b.nominated && <span className="text-[10px] text-rose-400 font-bold ml-1">指名</span>}</div>
+              <div className="text-sm text-stone-500 truncate">{b.menu} {b.memo ? '・' + b.memo : ''}</div>
+            </div>
+            <div className="text-right shrink-0">
+              <div className="tabnum font-bold text-stone-700">{b.price ? yen(b.price) : ''}</div>
+              <span className={'text-[10px] font-bold rounded-full px-2 py-0.5 ' + stt.chip}>{stt.label}</span>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ============================================================
+   設定（スタッフ・メニュー・営業時間・連携・バックアップ）
+   ============================================================ */
+function Settings({ s, setS, onClose }) {
+  const up = (patch) => setS({ ...s, settings: { ...s.settings, ...patch } });
+  const setStaff = (staff) => setS({ ...s, staff });
+  const setMenus = (menus) => setS({ ...s, menus });
+
+  const exportJSON = () => {
+    const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
+    const file = new File([blob], `サロねこ予約_バックアップ_${todayStr()}.json`, { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { navigator.share({ files: [file] }).catch(() => {}); return; }
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = file.name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const importJSON = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const r = new FileReader();
+    r.onload = () => { try { const data = JSON.parse(r.result); if (data.bookings && data.staff && data.settings) { if (confirm('バックアップを読み込みます。今のデータは上書きされます。よろしいですか？')) setS(data); } else alert('ファイル形式が違います'); } catch (err) { alert('読み込みに失敗しました'); } };
+    r.readAsText(file);
+  };
+
+  return (
+    <Modal onClose={onClose} wide>
+      <div className="p-5 space-y-5">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-extrabold text-stone-700">設定</h3>
+          <button onClick={onClose} className="px-4 py-2 rounded-xl bg-stone-100 text-stone-500 font-bold text-sm">閉じる</button>
+        </div>
+
+        {/* スタッフ */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="font-bold text-stone-600">担当者（席・面）</h4>
+            <button onClick={() => setStaff([...s.staff, { id: uid('s'), name: '', color: STAFF_COLORS[s.staff.length % STAFF_COLORS.length] }])}
+              className="bg-emerald-400 text-white px-3 py-1.5 rounded-full text-sm font-bold">＋ 追加</button>
+          </div>
+          <div className="space-y-2">
+            {s.staff.map((st, i) => (
+              <div key={st.id} className="flex items-center gap-2">
+                <input type="color" value={st.color} onChange={(e) => setStaff(s.staff.map((x) => x.id === st.id ? { ...x, color: e.target.value } : x))}
+                  className="w-10 h-10 rounded-lg border border-stone-200 shrink-0" />
+                <input value={st.name} onChange={(e) => setStaff(s.staff.map((x) => x.id === st.id ? { ...x, name: e.target.value } : x))} placeholder="担当名"
+                  className="flex-1 min-w-0 border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 text-base" />
+                {s.staff.length > 1 && <button onClick={() => setStaff(s.staff.filter((x) => x.id !== st.id))} className="w-10 h-10 rounded-xl bg-stone-50 text-rose-300 shrink-0">✕</button>}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* メニュー */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="font-bold text-stone-600">メニュー（時間・金額の目安）</h4>
+            <button onClick={() => setMenus([...s.menus, { id: uid('m'), name: '', durationMin: 60, price: 0 }])}
+              className="bg-emerald-400 text-white px-3 py-1.5 rounded-full text-sm font-bold">＋ 追加</button>
+          </div>
+          <div className="space-y-2">
+            {s.menus.map((mn) => (
+              <div key={mn.id} className="flex items-center gap-2">
+                <input value={mn.name} onChange={(e) => setMenus(s.menus.map((x) => x.id === mn.id ? { ...x, name: e.target.value } : x))} placeholder="メニュー名"
+                  className="flex-1 min-w-0 border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2 text-sm" />
+                <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden shrink-0">
+                  <input type="number" value={mn.durationMin} step={15} onChange={(e) => setMenus(s.menus.map((x) => x.id === mn.id ? { ...x, durationMin: parseInt(e.target.value, 10) || 0 } : x))}
+                    className="w-14 px-2 py-2 text-sm text-right tabnum bg-transparent outline-none" /><span className="px-1.5 text-xs text-stone-400">分</span>
+                </div>
+                <div className="flex items-center border-2 border-stone-100 bg-stone-50 rounded-xl overflow-hidden shrink-0">
+                  <span className="pl-2 text-stone-300 text-sm">¥</span>
+                  <input type="number" value={mn.price} step={500} onChange={(e) => setMenus(s.menus.map((x) => x.id === mn.id ? { ...x, price: parseInt(e.target.value, 10) || 0 } : x))}
+                    className="w-20 px-1 py-2 text-sm text-right tabnum bg-transparent outline-none" />
+                </div>
+                <button onClick={() => setMenus(s.menus.filter((x) => x.id !== mn.id))} className="w-9 h-9 rounded-xl bg-stone-50 text-rose-300 shrink-0">✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 営業時間 */}
+        <div>
+          <h4 className="font-bold text-stone-600 mb-2">営業時間・表示</h4>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <label className="block"><span className="text-xs text-stone-400 font-bold">開店</span>
+              <select value={s.settings.openHour} onChange={(e) => up({ openHour: parseInt(e.target.value, 10) })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 tabnum">
+                {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{i}:00</option>)}</select></label>
+            <label className="block"><span className="text-xs text-stone-400 font-bold">閉店</span>
+              <select value={s.settings.closeHour} onChange={(e) => up({ closeHour: parseInt(e.target.value, 10) })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 tabnum">
+                {Array.from({ length: 25 }, (_, i) => <option key={i} value={i}>{i}:00</option>)}</select></label>
+            <label className="block"><span className="text-xs text-stone-400 font-bold">きざみ</span>
+              <select value={s.settings.slotMin} onChange={(e) => up({ slotMin: parseInt(e.target.value, 10) })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5 tabnum">
+                {[15, 30, 60].map((v) => <option key={v} value={v}>{v}分</option>)}</select></label>
+            <label className="block"><span className="text-xs text-stone-400 font-bold">横の広さ</span>
+              <select value={s.settings.pxPerMin} onChange={(e) => up({ pxPerMin: parseFloat(e.target.value) })} className="mt-1 w-full border-2 border-stone-100 bg-stone-50 rounded-xl px-3 py-2.5">
+                {[{ v: 1.8, l: 'せまい' }, { v: 2.6, l: 'ふつう' }, { v: 3.6, l: 'ひろい' }].map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</select></label>
+          </div>
+        </div>
+
+        {/* サロねこ連携 */}
+        <div className="bg-peach rounded-2xl p-4">
+          <label className="flex items-center gap-3">
+            <input type="checkbox" checked={s.settings.linkSaloneko} onChange={(e) => up({ linkSaloneko: e.target.checked })} className="w-5 h-5 accent-rose-400" />
+            <div>
+              <div className="font-bold text-stone-700">サロねこ本体と売上を連携する</div>
+              <div className="text-xs text-stone-500">「来店」にすると、サロねこの「毎日入力」へ売上・客数を自動で足します{salonekoAvailable() ? '（連携OK：サロねこを検出）' : '（同じ場所にサロねこを開くと有効になります）'}</div>
+            </div>
+          </label>
+        </div>
+
+        {/* バックアップ */}
+        <div>
+          <h4 className="font-bold text-stone-600 mb-2">バックアップ（データはこの端末内だけ）</h4>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={exportJSON} className="bg-stone-600 text-white px-4 py-2.5 rounded-2xl font-bold text-sm">📤 書き出す（保存）</button>
+            <label className="bg-stone-100 text-stone-600 px-4 py-2.5 rounded-2xl font-bold text-sm cursor-pointer">
+              📥 読み込む<input type="file" accept="application/json" onChange={importJSON} className="hidden" /></label>
+          </div>
+          <p className="text-xs text-stone-400 mt-2">※定休日のバックアップがおすすめ。ブラウザのデータを消すと予約も消えます。</p>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   メインApp
+   ============================================================ */
+function App() {
+  const [s, setS] = useState(() => {
+    try { const saved = localStorage.getItem(STORE_KEY); if (saved) return { ...DEFAULT_STATE, ...JSON.parse(saved) }; } catch (e) {}
+    return DEFAULT_STATE;
+  });
+  const [date, setDate] = useState(todayStr());
+  const [view, setView] = useState('grid'); // grid | list
+  const [editing, setEditing] = useState(null); // booking or {date,staffId,start} for new
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(s)); } catch (e) {} }, [s]);
+
+  const day = s.bookings.filter((b) => b.date === date && b.status !== 'cancel');
+  const summary = useMemo(() => {
+    const all = s.bookings.filter((b) => b.date === date);
+    const active = all.filter((b) => b.status !== 'cancel' && b.status !== 'noshow');
+    const done = all.filter((b) => b.status === 'done');
+    return {
+      booked: active.length, done: done.length,
+      expect: active.reduce((a, b) => a + (b.price || 0), 0),
+      actual: done.reduce((a, b) => a + (b.price || 0), 0),
+    };
+  }, [s.bookings, date]);
+
+  const saveBooking = (b) => {
+    const exists = s.bookings.some((x) => x.id === b.id);
+    setS({ ...s, bookings: exists ? s.bookings.map((x) => x.id === b.id ? b : x) : [...s.bookings, b] });
+    setEditing(null);
+  };
+  const deleteBooking = (b) => { setS({ ...s, bookings: s.bookings.filter((x) => x.id !== b.id) }); setEditing(null); };
+  // 状態変更（来店連携の二重防止つき）
+  const setStatus = (b, status) => {
+    let nb = { ...b, status };
+    if (s.settings.linkSaloneko) {
+      if (status === 'done' && !b.pushed) { pushSaleToSaloneko(b, +1); nb.pushed = true; }
+      if (status !== 'done' && b.pushed) { pushSaleToSaloneko(b, -1); nb.pushed = false; }
+    }
+    const exists = s.bookings.some((x) => x.id === nb.id);
+    setS({ ...s, bookings: exists ? s.bookings.map((x) => x.id === nb.id ? nb : x) : [...s.bookings, nb] });
+    setEditing(null);
+  };
+
+  return (
+    <div className="min-h-screen pb-10">
+      {/* ヘッダー */}
+      <header className="bg-gradient-to-br from-rose-300 via-rose-200 to-amber-200 text-stone-700 sticky top-0 z-30 shadow-soft">
+        <div className="max-w-[1400px] mx-auto px-3 py-2.5 flex items-center gap-3 flex-wrap">
+          <h1 className="text-lg font-extrabold shrink-0">📅 {s.settings.businessName}</h1>
+          {/* 日付ナビ */}
+          <div className="flex items-center gap-1">
+            <button onClick={() => setDate(shiftDate(date, -1))} className="w-9 h-9 rounded-full bg-white/70 font-bold">‹</button>
+            <button onClick={() => setDate(todayStr())} className="px-3 h-9 rounded-full bg-white/70 font-bold text-sm">今日</button>
+            <button onClick={() => setDate(shiftDate(date, 1))} className="w-9 h-9 rounded-full bg-white/70 font-bold">›</button>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="ml-1 bg-white/70 rounded-xl px-2 h-9 text-sm font-bold tabnum" />
+            <span className="ml-1 font-extrabold tabnum">{fmtDate(date)}</span>
+          </div>
+          <div className="flex-1" />
+          {/* サマリー */}
+          <div className="flex items-center gap-2 text-sm">
+            <span className="bg-white/70 rounded-full px-3 h-9 flex items-center font-bold">予約 <b className="ml-1 tabnum text-rose-500">{summary.booked}</b></span>
+            <span className="bg-white/70 rounded-full px-3 h-9 flex items-center font-bold">来店 <b className="ml-1 tabnum text-emerald-600">{summary.done}</b></span>
+            <span className="bg-white/70 rounded-full px-3 h-9 flex items-center font-bold tabnum">見込 {yen(summary.expect)}</span>
+            <span className="hidden sm:flex bg-white/80 rounded-full px-3 h-9 items-center font-bold tabnum text-emerald-700">実績 {yen(summary.actual)}</span>
+          </div>
+          {/* 表示切替・設定 */}
+          <div className="flex items-center gap-1">
+            <div className="flex bg-white/50 rounded-full p-0.5">
+              <button onClick={() => setView('grid')} className={'px-3 h-8 rounded-full text-sm font-bold ' + (view === 'grid' ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-500')}>台帳</button>
+              <button onClick={() => setView('list')} className={'px-3 h-8 rounded-full text-sm font-bold ' + (view === 'list' ? 'bg-white text-rose-400 shadow-soft' : 'text-stone-500')}>リスト</button>
+            </div>
+            <button onClick={() => setShowSettings(true)} className="w-9 h-9 rounded-full bg-white/70 font-bold">⚙️</button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-[1400px] mx-auto px-3 pt-3 fadein">
+        {view === 'grid'
+          ? <LedgerGrid s={s} date={date} onCell={(cell) => setEditing(cell)} onOpen={(b) => setEditing(b)} />
+          : <AgendaList s={s} date={date} onOpen={(b) => setEditing(b)} />}
+      </main>
+
+      {/* 追加ボタン（右下フローティング） */}
+      <button onClick={() => setEditing({ date, staffId: s.staff[0].id, start: '10:00' })}
+        className="fixed bottom-5 right-5 z-30 w-16 h-16 rounded-full bg-rose-400 hover:bg-rose-500 text-white text-3xl font-bold shadow-soft flex items-center justify-center active:scale-95">＋</button>
+
+      {editing && <BookingForm s={s} initial={editing} onSave={saveBooking} onDelete={deleteBooking} onClose={() => setEditing(null)} setStatus={setStatus} />}
+      {showSettings && <Settings s={s} setS={setS} onClose={() => setShowSettings(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
